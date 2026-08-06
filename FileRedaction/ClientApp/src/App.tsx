@@ -3,7 +3,7 @@ import FileUpload from './components/FileUpload'
 import EntitySelector from './components/EntitySelector'
 import DocumentPreview from './components/DocumentPreview'
 import { getUploadStatus } from './api'
-import type { UploadResponse, UploadAcceptedResponse } from './types'
+import type { UploadResponse, UploadAcceptedResponse, PreviewResponse } from './types'
 
 type Step = 'upload' | 'processing' | 'select' | 'preview' | 'done'
 
@@ -23,10 +23,17 @@ export default function App() {
   const [processingPhase, setProcessingPhase] = useState<string>('extracting')
   const [processingError, setProcessingError] = useState<string>('')
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [previewCache, setPreviewCache] = useState<{ key: string; data: PreviewResponse } | null>(null)
 
   function handleEntityAdded(entity: import('./types').PiiEntity) {
     if (!uploadResult) return
     setUploadResult({ ...uploadResult, entities: [...uploadResult.entities, entity] })
+    setPreviewCache(null) // new entity added — invalidate cached preview
+  }
+
+  function handleSelectionChange(ids: Set<string>) {
+    setSelectedIds(ids)
+    setPreviewCache(null) // selection changed — invalidate cached preview
   }
 
   const stepIndex: Record<Step, number> = { upload: 0, processing: 0, select: 1, preview: 2, done: 3 }
@@ -130,7 +137,7 @@ export default function App() {
             sessionId={uploadResult.sessionId}
             entities={uploadResult.entities}
             selectedIds={selectedIds}
-            onSelectionChange={setSelectedIds}
+            onSelectionChange={handleSelectionChange}
             onEntityAdded={handleEntityAdded}
             onNext={() => setStep('preview')}
             fileName={uploadResult.originalFileName}
@@ -145,6 +152,8 @@ export default function App() {
             fileName={uploadResult.originalFileName}
             onBack={() => setStep('select')}
             onDone={() => setStep('done')}
+            previewCache={previewCache}
+            onPreviewCached={setPreviewCache}
           />
         )}
 

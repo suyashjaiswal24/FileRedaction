@@ -1,3 +1,5 @@
+extern alias AsposeDrawing;
+using AD = AsposeDrawing::System.Drawing;
 using Azure;
 using Azure.AI.FormRecognizer.DocumentAnalysis;
 
@@ -53,11 +55,33 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
         _logger = logger;
     }
 
+    // Azure DI F0 free tier image limit — large images are compressed before submission
+    private const long MaxImageBytes = 4_000_000;
+
+    private static readonly HashSet<string> ImageExts =
+        [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"];
+
     public async Task<DocumentExtractionResult> AnalyzeDocumentAsync(string filePath)
     {
-        _logger.LogInformation("═══ DOCUMENT INTELLIGENCE ═══ Sending '{File}' for analysis", Path.GetFileName(filePath));
+        var fileSize = new FileInfo(filePath).Length;
+        var ext = Path.GetExtension(filePath).ToLowerInvariant();
+        _logger.LogInformation("═══ DOCUMENT INTELLIGENCE ═══ Sending '{File}' ({Size:N0} bytes) for analysis",
+            Path.GetFileName(filePath), fileSize);
 
-        await using var stream = File.OpenRead(filePath);
+        Stream stream;
+        if (ImageExts.Contains(ext) && fileSize > MaxImageBytes)
+        {
+            _logger.LogInformation("Image exceeds {Max:N0} bytes — compressing before DI submission", MaxImageBytes);
+            stream = CompressImage(filePath);
+            _logger.LogInformation("Compressed to {Size:N0} bytes", stream.Length);
+        }
+        else
+        {
+            stream = File.OpenRead(filePath);
+        }
+
+        await using (stream)
+        {
         var operation = await _client.AnalyzeDocumentAsync(WaitUntil.Completed, "prebuilt-read", stream);
         var result = operation.Value;
 
@@ -123,5 +147,32 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
         _logger.LogInformation("═══ FULL EXTRACTED TEXT saved to: {DumpPath}", dumpPath);
 
         return new DocumentExtractionResult { FullText = fullText, Words = words, Pages = pages };
+        } // end await using stream
+    }
+
+    private static MemoryStream CompressImage(string filePath)
+    {
+        using var src = new AD.Bitmap(new MemoryStream(File.ReadAllBytes(filePath)));
+
+        // Scale down proportionally so the compressed JPEG fits under MaxDiBytes
+        var fileSize = new FileInfo(filePath).Length;
+        float scale = Math.Min(1f, (float)Math.Sqrt((double)MaxImageBytes / fileSize) * 0.9f);
+        int w = Math.Max(1, (int)(src.Width * scale));
+        int h = Math.Max(1, (int)(src.Height * scale));
+
+        using var resized = new AD.Bitmap(w, h);
+        using (var g = AD.Graphics.FromImage(resized))
+            g.DrawImage(src, 0, 0, w, h);
+
+        var ms = new MemoryStream();
+        var jpegEncoder = AsposeDrawing::System.Drawing.Imaging.ImageCodecInfo
+            .GetImageEncoders()
+            .First(c => c.FormatID == AsposeDrawing::System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
+        var encoderParams = new AsposeDrawing::System.Drawing.Imaging.EncoderParameters(1);
+        encoderParams.Param[0] = new AsposeDrawing::System.Drawing.Imaging.EncoderParameter(
+            AsposeDrawing::System.Drawing.Imaging.Encoder.Quality, 75L);
+        resized.Save(ms, jpegEncoder, encoderParams);
+        ms.Position = 0;
+        return ms;
     }
 }

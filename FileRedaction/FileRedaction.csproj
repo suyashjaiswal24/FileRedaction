@@ -12,6 +12,9 @@
     </PackageReference>
     <PackageReference Include="Azure.AI.FormRecognizer" Version="4.1.0" />
     <PackageReference Include="Aspose.PDF" Version="24.9.0" />
+    <PackageReference Include="Aspose.Words" Version="24.9.0" />
+    <PackageReference Include="Aspose.Cells" Version="24.9.0" />
+    <PackageReference Include="Aspose.Slides.NET" Version="24.9.0" />
   </ItemGroup>
 
 </Project>

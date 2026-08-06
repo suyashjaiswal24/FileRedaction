@@ -12,6 +12,7 @@ namespace FileRedaction.Services;
 public interface IRedactionService
 {
     Task<string> CreateHighlightedPreviewAsync(string filePath, List<PiiEntityResult> selectedEntities);
+    Task<string> AddHighlightsToExistingAsync(string existingHighlightedPath, List<PiiEntityResult> entitiesToAdd);
     Task<string> ApplyPermanentRedactionAsync(string filePath, List<PiiEntityResult> selectedEntities);
 }
 
@@ -56,6 +57,64 @@ public class RedactionService : IRedactionService
 
             doc.Save(previewPath);
             return previewPath;
+        });
+    }
+
+    public async Task<string> AddHighlightsToExistingAsync(string existingHighlightedPath, List<PiiEntityResult> entitiesToAdd)
+    {
+        var ext = Path.GetExtension(existingHighlightedPath).ToLowerInvariant();
+
+        if (ImageExtensions.Contains(ext))
+        {
+            return await Task.Run(() =>
+            {
+                var outPath = Path.Combine(Path.GetTempPath(), $"preview_{Guid.NewGuid():N}.png");
+                using var ms = new MemoryStream(File.ReadAllBytes(existingHighlightedPath));
+                using var bmp = new AD.Bitmap(ms);
+                using var g = AD.Graphics.FromImage(bmp);
+
+                var dpiX = bmp.HorizontalResolution;
+                var dpiY = bmp.VerticalResolution;
+
+                using var brush = new AD.SolidBrush(System.Drawing.Color.FromArgb(120, System.Drawing.Color.Yellow));
+                using var pen = new AD.Pen(System.Drawing.Color.FromArgb(200, System.Drawing.Color.Orange), 1.5f);
+
+                foreach (var entity in entitiesToAdd)
+                    foreach (var region in entity.BoundingRegions)
+                    {
+                        var rect = PolygonToPixelRect(region.Polygon, region.IsPixelUnit, dpiX, dpiY);
+                        if (rect == System.Drawing.RectangleF.Empty) continue;
+                        g.FillRectangle(brush, rect);
+                        g.DrawRectangle(pen, rect.X, rect.Y, rect.Width, rect.Height);
+                    }
+
+                using var outStream = File.OpenWrite(outPath);
+                bmp.Save(outStream, AsposeDrawing::System.Drawing.Imaging.ImageFormat.Png);
+                return outPath;
+            });
+        }
+
+        // PDF: open existing highlighted PDF, add new annotations on top
+        return await Task.Run(() =>
+        {
+            var outPath = Path.Combine(Path.GetTempPath(), $"preview_{Guid.NewGuid():N}.pdf");
+            using var doc = new Aspose.Pdf.Document(existingHighlightedPath);
+
+            foreach (var entity in entitiesToAdd)
+                foreach (var fragment in FindTextFragments(doc, entity.Text))
+                {
+                    var highlight = new HighlightAnnotation(fragment.Page, fragment.Rectangle)
+                    {
+                        Color = Aspose.Pdf.Color.Yellow,
+                        Opacity = 0.5,
+                        Title = entity.Category,
+                        Contents = $"{entity.Category}: {entity.Text}"
+                    };
+                    fragment.Page.Annotations.Add(highlight);
+                }
+
+            doc.Save(outPath);
+            return outPath;
         });
     }
 

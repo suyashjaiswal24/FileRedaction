@@ -67,10 +67,18 @@ public class SessionData
     // Raw DI words — kept for manual search and image bounding-box lookup
     public List<WordSearchResult> Words { get; set; } = new();
 
+    // Cached PDF path — null until first preview/redact request triggers Office→PDF conversion
+    public string? PdfFilePath { get; set; }
+
     // Background processing state
     public string Status { get; set; } = "processing"; // processing | ready | error
     public string Phase { get; set; } = string.Empty;  // extracting | detecting | ""
     public string? ErrorMessage { get; set; }
+
+    // Incremental highlight cache — avoids regenerating all N highlights when only adding 1
+    // For Excel: path to highlighted .xlsx (intermediate); for PDF/image: path to highlighted PDF/PNG
+    public string? CachedHighlightWorkingPath { get; set; }
+    public List<string> CachedHighlightEntityIds { get; set; } = new();
 }
 
 public class AddEntityRequest

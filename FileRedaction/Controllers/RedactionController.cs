@@ -12,17 +12,14 @@ public class RedactionController : ControllerBase
     private static readonly string[] AllowedExtensions =
     {
         ".pdf",
-        ".docx", ".doc",
-        ".xlsx", ".xls",
-        ".pptx", ".ppt",
+        ".docx", ".doc", ".docm", ".odt", ".rtf",
+        ".xlsx", ".xls", ".ods",
+        ".pptx", ".ppt", ".odp",
         ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"
     };
 
     private static readonly HashSet<string> ImageExtensions =
     [".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"];
-
-    private static readonly HashSet<string> OfficeExtensions =
-    [".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt"];
 
     private static readonly FileExtensionContentTypeProvider _mimeProvider = new();
 
@@ -35,6 +32,7 @@ public class RedactionController : ControllerBase
     private readonly IDocumentIntelligenceService _docIntelligence;
     private readonly IPiiDetectionService _piiDetection;
     private readonly IRedactionService _redaction;
+    private readonly IOfficeConversionService _officeConverter;
     private readonly SessionStore _sessions;
     private readonly IConfiguration _config;
     private readonly ILogger<RedactionController> _logger;
@@ -44,6 +42,7 @@ public class RedactionController : ControllerBase
         IDocumentIntelligenceService docIntelligence,
         IPiiDetectionService piiDetection,
         IRedactionService redaction,
+        IOfficeConversionService officeConverter,
         SessionStore sessions,
         IConfiguration config,
         ILogger<RedactionController> logger,
@@ -52,6 +51,7 @@ public class RedactionController : ControllerBase
         _docIntelligence = docIntelligence;
         _piiDetection = piiDetection;
         _redaction = redaction;
+        _officeConverter = officeConverter;
         _sessions = sessions;
         _config = config;
         _logger = logger;
@@ -93,7 +93,7 @@ public class RedactionController : ControllerBase
         });
 
         // Phase 2: fire and forget — in the real project this becomes an Azure Function trigger
-        _ = Task.Run(() => ProcessUploadAsync(sessionId, filePath, file.FileName, _scopeFactory));
+        _ = Task.Run(() => ProcessUploadAsync(sessionId, filePath, _scopeFactory));
 
         return Ok(new UploadAcceptedResponse
         {
@@ -120,7 +120,7 @@ public class RedactionController : ControllerBase
         });
     }
 
-    private async Task ProcessUploadAsync(string sessionId, string filePath, string originalFileName, IServiceScopeFactory scopeFactory)
+    private async Task ProcessUploadAsync(string sessionId, string filePath, IServiceScopeFactory scopeFactory)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var docIntelligence = scope.ServiceProvider.GetRequiredService<IDocumentIntelligenceService>();
@@ -133,6 +133,8 @@ public class RedactionController : ControllerBase
 
         try
         {
+            // DI extraction runs on the ORIGINAL file — Azure DI natively supports XLSX/DOCX/PPTX,
+            // so a 76KB Excel stays 76KB here instead of becoming a 6MB Aspose-converted PDF.
             session.Phase = "extracting";
             logger.LogInformation("Background: starting DI extraction for session {Id}", sessionId);
             var extraction = await docIntelligence.AnalyzeDocumentAsync(filePath);
@@ -170,10 +172,23 @@ public class RedactionController : ControllerBase
     }
 
     /// <summary>
-    /// Generates a preview URL for docpreview.stackkitlabs.com.
-    /// For PDFs: creates a highlighted copy (yellow annotations) and serves that.
-    /// For all other formats: serves the original file — docpreview handles rendering.
+    /// Converts Office file to PDF on first preview/redact request and caches the path.
+    /// Subsequent calls reuse the cached PDF.
     /// </summary>
+    private string GetOrConvertToPdf(SessionData session)
+    {
+        if (session.PdfFilePath is not null) return session.PdfFilePath;
+
+        lock (session)
+        {
+            if (session.PdfFilePath is not null) return session.PdfFilePath;
+
+            _logger.LogInformation("Lazy PDF conversion triggered for session {Id}", session.SessionId);
+            session.PdfFilePath = _officeConverter.ConvertToPdf(session.FilePath);
+            return session.PdfFilePath;
+        }
+    }
+
     [HttpPost("preview")]
     public async Task<ActionResult> Preview([FromBody] PreviewRequest request)
     {
@@ -183,31 +198,97 @@ public class RedactionController : ControllerBase
         if (!request.SelectedEntityIds.Any())
             return BadRequest("No entities selected.");
 
+        // Resolve which file to use: Office formats convert to PDF on first call
         var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
-        var canHighlight = ext == ".pdf" || ImageExtensions.Contains(ext);
-
-        string previewFilePath;
-        if (canHighlight)
+        string workingFilePath;
+        string workingExt;
+        if (_officeConverter.NeedsPdfConversion(ext))
         {
-            var selected = session.Entities
-                .Where(e => request.SelectedEntityIds.Contains(e.Id))
-                .ToList();
-            previewFilePath = await _redaction.CreateHighlightedPreviewAsync(session.FilePath, selected);
+            workingFilePath = GetOrConvertToPdf(session);
+            workingExt = ".pdf";
         }
         else
         {
-            // Office formats: serve original — DocPreview renders it; highlights not supported without Aspose.Words/Cells/Slides
-            previewFilePath = session.FilePath;
+            workingFilePath = session.FilePath;
+            workingExt = ext;
         }
 
-        var token = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(previewFilePath));
-        var fileUrl = $"/api/redaction/file/{Uri.EscapeDataString(token)}";
+        var selectedSet = new HashSet<string>(request.SelectedEntityIds);
+        var cachedSet = new HashSet<string>(session.CachedHighlightEntityIds);
+        var removedIds = cachedSet.Except(selectedSet).ToHashSet();
+        var addedIds = selectedSet.Except(cachedSet).ToHashSet();
+
+        bool hasCachedFile = session.CachedHighlightWorkingPath != null
+                             && System.IO.File.Exists(session.CachedHighlightWorkingPath);
+        bool canIncremental = hasCachedFile && !removedIds.Any() && addedIds.Any();
+
+        string previewFilePath;
+        bool hasHighlights;
+
+        if (workingExt == ".pdf" || ImageExtensions.Contains(workingExt))
+        {
+            string highlighted;
+            if (canIncremental)
+            {
+                var added = session.Entities.Where(e => addedIds.Contains(e.Id)).ToList();
+                _logger.LogInformation("Incremental highlight: adding {Count} entity/entities to cached preview", added.Count);
+                highlighted = await _redaction.AddHighlightsToExistingAsync(session.CachedHighlightWorkingPath!, added);
+            }
+            else
+            {
+                var selected = session.Entities.Where(e => selectedSet.Contains(e.Id)).ToList();
+                highlighted = await _redaction.CreateHighlightedPreviewAsync(workingFilePath, selected);
+            }
+            session.CachedHighlightWorkingPath = highlighted;
+            session.CachedHighlightEntityIds = selectedSet.ToList();
+            previewFilePath = highlighted;
+            hasHighlights = true;
+        }
+        else if (_officeConverter.IsExcelFormat(workingExt))
+        {
+            string highlightedXlsx;
+            if (canIncremental)
+            {
+                var addedTexts = session.Entities.Where(e => addedIds.Contains(e.Id)).Select(e => e.Text).Distinct().ToList();
+                _logger.LogInformation("Incremental Excel highlight: adding {Count} text(s) to cached xlsx", addedTexts.Count);
+                highlightedXlsx = _officeConverter.AddHighlightsToExistingExcel(session.CachedHighlightWorkingPath!, addedTexts);
+            }
+            else
+            {
+                var allTexts = session.Entities.Where(e => selectedSet.Contains(e.Id)).Select(e => e.Text).Distinct().ToList();
+                highlightedXlsx = _officeConverter.CreateHighlightedExcel(workingFilePath, allTexts);
+            }
+            session.CachedHighlightWorkingPath = highlightedXlsx;
+            session.CachedHighlightEntityIds = selectedSet.ToList();
+            previewFilePath = _officeConverter.ExportExcelToHtml(highlightedXlsx);
+            hasHighlights = true;
+        }
+        else
+        {
+            previewFilePath = workingFilePath;
+            hasHighlights = false;
+        }
+
+        var fileType = Path.GetExtension(previewFilePath).TrimStart('.');
+        string fileUrl;
+        if (fileType == "html")
+        {
+            // Serve via directory-aware endpoint so companion files (CSS, sheet HTMs) resolve correctly
+            var dir = Path.GetDirectoryName(previewFilePath)!;
+            var dirToken = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(dir));
+            fileUrl = $"/api/redaction/preview-html/{Uri.EscapeDataString(dirToken)}/preview.html";
+        }
+        else
+        {
+            var token = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(previewFilePath));
+            fileUrl = $"/api/redaction/file/{Uri.EscapeDataString(token)}";
+        }
 
         return Ok(new
         {
             fileUrl,
-            hasHighlights = canHighlight,
-            fileType = ext.TrimStart('.')
+            hasHighlights,
+            fileType
         });
     }
 
@@ -229,6 +310,40 @@ public class RedactionController : ControllerBase
         var safePath = Path.GetFullPath(path);
         var tempRoot = Path.GetFullPath(Path.GetTempPath());
         if (!safePath.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase))
+            return Forbid();
+
+        if (!System.IO.File.Exists(safePath))
+            return NotFound();
+
+        return PhysicalFile(safePath, GetMimeType(safePath));
+    }
+
+    /// <summary>
+    /// Serves Aspose-generated HTML preview directories so companion files (CSS, sheet HTMs) resolve correctly.
+    /// The browser fetches preview.html first, then requests relative paths like preview_files/sheet001.htm
+    /// which all resolve to this same endpoint.
+    /// </summary>
+    [HttpGet("preview-html/{dirToken}/{*relativePath}")]
+    public IActionResult GetPreviewHtmlFile(string dirToken, string relativePath)
+    {
+        string dir;
+        try
+        {
+            dir = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(Uri.UnescapeDataString(dirToken)));
+        }
+        catch
+        {
+            return BadRequest("Invalid token.");
+        }
+
+        var safeDir = Path.GetFullPath(dir);
+        var tempRoot = Path.GetFullPath(Path.GetTempPath());
+        if (!safeDir.StartsWith(tempRoot, StringComparison.OrdinalIgnoreCase))
+            return Forbid();
+
+        var safePath = Path.GetFullPath(Path.Combine(safeDir, relativePath));
+        // Prevent path traversal outside the preview directory
+        if (!safePath.StartsWith(safeDir, StringComparison.OrdinalIgnoreCase))
             return Forbid();
 
         if (!System.IO.File.Exists(safePath))
@@ -322,18 +437,31 @@ public class RedactionController : ControllerBase
         if (!request.SelectedEntityIds.Any())
             return BadRequest("No entities selected.");
 
-        var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
-        if (OfficeExtensions.Contains(ext))
-            return BadRequest($"Permanent redaction of {ext.TrimStart('.')} files is not yet supported. Please use a PDF or image file.");
-
         var selected = session.Entities
             .Where(e => request.SelectedEntityIds.Contains(e.Id))
             .ToList();
 
-        var redactedPath = await _redaction.ApplyPermanentRedactionAsync(session.FilePath, selected);
+        var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
+        string redactedPath;
 
+        if (_officeConverter.IsExcelFormat(ext))
+        {
+            // Excel: in-place cell text replacement — output stays as Excel
+            var texts = selected.Select(e => e.Text).Distinct().ToList();
+            redactedPath = _officeConverter.RedactExcel(session.FilePath, texts);
+        }
+        else
+        {
+            // PDF / images / Word / Slides (converted to PDF): use redaction service
+            var redactFilePath = _officeConverter.NeedsPdfConversion(ext)
+                ? GetOrConvertToPdf(session)
+                : session.FilePath;
+            redactedPath = await _redaction.ApplyPermanentRedactionAsync(redactFilePath, selected);
+        }
+
+        var redactedExt = Path.GetExtension(redactedPath).ToLowerInvariant();
         var mime = GetMimeType(redactedPath);
-        var downloadName = Path.GetFileNameWithoutExtension(session.OriginalFileName) + "_redacted" + ext;
+        var downloadName = Path.GetFileNameWithoutExtension(session.OriginalFileName) + "_redacted" + redactedExt;
         return PhysicalFile(redactedPath, mime, downloadName);
     }
 }

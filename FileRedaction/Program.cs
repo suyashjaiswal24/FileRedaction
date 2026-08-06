@@ -8,6 +8,7 @@ builder.Services.AddSingleton<SessionStore>();
 builder.Services.AddScoped<IDocumentIntelligenceService, DocumentIntelligenceService>();
 builder.Services.AddScoped<IPiiDetectionService, PiiDetectionService>();
 builder.Services.AddScoped<IRedactionService, RedactionService>();
+builder.Services.AddSingleton<IOfficeConversionService, OfficeConversionService>();
 
 // Named HttpClient for the Azure AI Language Service (PII detection)
 builder.Services.AddHttpClient(nameof(PiiDetectionService), (sp, client) =>

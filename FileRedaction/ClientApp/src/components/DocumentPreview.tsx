@@ -10,24 +10,35 @@ interface Props {
   fileName: string
   onBack: () => void
   onDone: () => void
+  previewCache: { key: string; data: PreviewResponse } | null
+  onPreviewCached: (cache: { key: string; data: PreviewResponse }) => void
 }
 
 const ENTERPRISE_KEY = 'DP-ENT-DEMO-2026-FULL'
 
-export default function DocumentPreview({ sessionId, selectedEntityIds, selectedCount, fileName, onBack, onDone }: Props) {
+export default function DocumentPreview({ sessionId, selectedEntityIds, selectedCount, fileName, onBack, onDone, previewCache, onPreviewCached }: Props) {
   const [status, setStatus] = useState<'loading' | 'ready' | 'redacting' | 'error'>('loading')
   const [preview, setPreview] = useState<PreviewResponse | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
 
   const ext = fileName.split('.').pop()?.toLowerCase() ?? ''
-  const officeExts = new Set(['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt'])
-  const isOfficeOnly = officeExts.has(ext)
+  const cacheKey = [...selectedEntityIds].sort().join(',')
 
   useEffect(() => {
+    if (previewCache?.key === cacheKey) {
+      setPreview(previewCache.data)
+      setStatus('ready')
+      return
+    }
+    setStatus('loading')
     getPreview(sessionId, selectedEntityIds)
-      .then(p => { setPreview(p); setStatus('ready') })
+      .then(p => {
+        setPreview(p)
+        setStatus('ready')
+        onPreviewCached({ key: cacheKey, data: p })
+      })
       .catch(async err => { setErrorMsg(await errorMessage(err)); setStatus('error') })
-  }, [sessionId, selectedEntityIds])
+  }, [cacheKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleRedact() {
     if (!preview) return
@@ -37,7 +48,9 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = fileName.replace(/\.[^.]+$/, '') + '_redacted.' + ext
+      // Excel preview is HTML but the redacted download is the original format (xlsx/xls/ods)
+      const downloadExt = previewFileType === 'html' ? ext : previewFileType
+      a.download = fileName.replace(/\.[^.]+$/, '') + '_redacted.' + downloadExt
       a.click()
       URL.revokeObjectURL(url)
       onDone()
@@ -60,11 +73,17 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
     return err instanceof Error ? err.message : 'Unknown error'
   }
 
+  // Use the actual file type from backend (Office files are converted to PDF server-side)
+  const previewFileType = preview?.fileType ?? ext
+  const previewFileName = preview
+    ? fileName.replace(/\.[^.]+$/, '.' + preview.fileType)
+    : fileName
+  const isOfficeOnly = false // All office formats are converted to PDF before preview
+  const documents = preview ? [{ uri: preview.fileUrl, fileName: previewFileName }] : []
+
   const subtitle = preview?.hasHighlights
     ? `${selectedCount} entit${selectedCount === 1 ? 'y' : 'ies'} highlighted in yellow — confirm to permanently black them out.`
-    : `${selectedCount} entit${selectedCount === 1 ? 'y' : 'ies'} selected for redaction. Previewing ${preview?.fileType.toUpperCase() ?? ext.toUpperCase()} document.`
-
-  const documents = preview ? [{ uri: preview.fileUrl, fileName }] : []
+    : `${selectedCount} entit${selectedCount === 1 ? 'y' : 'ies'} selected for redaction. Previewing ${previewFileType.toUpperCase()} document.`
 
   return (
     <div style={{ maxWidth: 960, margin: '40px auto' }}>
@@ -98,9 +117,7 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
           {status === 'loading' && (
             <div style={styles.centered}>
               <div style={styles.spinner} />
-              <p style={{ marginTop: 16, color: '#555' }}>
-                {ext === 'pdf' ? 'Generating highlighted preview…' : 'Preparing preview…'}
-              </p>
+              <p style={{ marginTop: 16, color: '#555' }}>Generating highlighted preview…</p>
             </div>
           )}
 
@@ -117,7 +134,25 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
             </div>
           )}
 
-          {status === 'ready' && preview && (
+          {status === 'ready' && preview && previewFileType === 'html' && (
+            <div style={styles.centered}>
+              <div style={{ fontSize: 40, marginBottom: 16 }}>📊</div>
+              <p style={{ fontWeight: 600, fontSize: 16, marginBottom: 8 }}>Excel Preview with Highlights</p>
+              <p style={{ color: '#555', fontSize: 14, marginBottom: 24, maxWidth: 380, textAlign: 'center' }}>
+                Yellow-highlighted cells are shown in the browser-rendered preview. Click below to open it.
+              </p>
+              <a
+                href={preview.fileUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={styles.openTabBtn}
+              >
+                Open highlighted preview ↗
+              </a>
+            </div>
+          )}
+
+          {status === 'ready' && preview && previewFileType !== 'html' && (
             <div style={{ display: 'flex', flexDirection: 'column' }}>
               <div style={styles.previewToolbar}>
                 <a href={preview.fileUrl} target="_blank" rel="noreferrer" style={styles.openTabLink}>
@@ -194,6 +229,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   openTabLink: {
     fontSize: 12, color: '#4f7ef8', textDecoration: 'none', fontWeight: 500
+  },
+  openTabBtn: {
+    background: '#4f7ef8', color: '#fff', borderRadius: 10,
+    padding: '12px 28px', fontWeight: 600, fontSize: 15, textDecoration: 'none',
+    display: 'inline-block'
   },
   errorBox: {
     padding: '12px 16px', background: '#fff0f0', border: '1px solid #fca5a5',
