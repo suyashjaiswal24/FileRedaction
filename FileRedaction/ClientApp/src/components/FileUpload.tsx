@@ -1,29 +1,28 @@
 import { useState, useRef, DragEvent, ChangeEvent } from 'react'
 import { uploadFile } from '../api'
-import type { UploadResponse } from '../types'
+import type { UploadAcceptedResponse } from '../types'
 
 interface Props {
-  onUploadComplete: (result: UploadResponse) => void
+  onUploadComplete: (result: UploadAcceptedResponse) => void
+  initialError?: string
 }
 
 const ACCEPTED = '.pdf,.docx,.doc,.png,.jpg,.jpeg,.tiff,.tif'
 const ACCEPTED_LABEL = 'PDF, DOCX, PNG, JPG, TIFF'
 
-export default function FileUpload({ onUploadComplete }: Props) {
+export default function FileUpload({ onUploadComplete, initialError }: Props) {
   const [dragging, setDragging] = useState(false)
-  const [status, setStatus] = useState<'idle' | 'uploading' | 'error'>('idle')
-  const [errorMsg, setErrorMsg] = useState('')
+  const [status, setStatus] = useState<'idle' | 'uploading' | 'error'>(initialError ? 'error' : 'idle')
+  const [errorMsg, setErrorMsg] = useState(initialError ?? '')
   const [progressLabel, setProgressLabel] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
 
   async function handleFile(file: File) {
     setStatus('uploading')
-    setProgressLabel('Uploading and extracting text…')
+    setProgressLabel('Uploading…')
     setErrorMsg('')
     try {
-      setProgressLabel('Azure Document Intelligence is analysing the document…')
       const result = await uploadFile(file)
-      setProgressLabel('Detecting PII entities…')
       onUploadComplete(result)
     } catch (err: unknown) {
       const msg = axios_message(err)

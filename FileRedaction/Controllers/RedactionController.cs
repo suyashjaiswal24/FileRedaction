@@ -38,6 +38,7 @@ public class RedactionController : ControllerBase
     private readonly SessionStore _sessions;
     private readonly IConfiguration _config;
     private readonly ILogger<RedactionController> _logger;
+    private readonly IServiceScopeFactory _scopeFactory;
 
     public RedactionController(
         IDocumentIntelligenceService docIntelligence,
@@ -45,7 +46,8 @@ public class RedactionController : ControllerBase
         IRedactionService redaction,
         SessionStore sessions,
         IConfiguration config,
-        ILogger<RedactionController> logger)
+        ILogger<RedactionController> logger,
+        IServiceScopeFactory scopeFactory)
     {
         _docIntelligence = docIntelligence;
         _piiDetection = piiDetection;
@@ -53,12 +55,16 @@ public class RedactionController : ControllerBase
         _sessions = sessions;
         _config = config;
         _logger = logger;
+        _scopeFactory = scopeFactory;
     }
 
-    /// <summary>Upload a file, extract text, and detect PII — returns entity list.</summary>
+    /// <summary>
+    /// Phase 1 (sync): saves the file and returns a sessionId immediately.
+    /// Phase 2 (background): DI extraction + PII detection run async; poll GET /{sessionId}/status.
+    /// </summary>
     [HttpPost("upload")]
-    [RequestSizeLimit(52_428_800)] // 50 MB
-    public async Task<ActionResult<UploadResponse>> Upload(IFormFile file)
+    [RequestSizeLimit(20_971_520)] // 20 MB
+    public async Task<ActionResult<UploadAcceptedResponse>> Upload(IFormFile file)
     {
         if (file is null || file.Length == 0)
             return BadRequest("No file provided.");
@@ -77,37 +83,90 @@ public class RedactionController : ControllerBase
 
         _logger.LogInformation("Uploaded {Name} ({Size:N0} bytes), session {Id}", file.FileName, file.Length, sessionId);
 
-        var extraction = await _docIntelligence.AnalyzeDocumentAsync(filePath);
-        var entities = await _piiDetection.DetectPiiAsync(extraction.FullText, extraction.Words, extraction.Pages);
-
-        // Build searchable word list for manual addition (especially needed for image files)
-        var wordList = extraction.Words
-            .GroupBy(w => w.Content.ToLowerInvariant())
-            .Select(g => g.First())
-            .Select(w => new WordSearchResult
-            {
-                Text = w.Content,
-                PageNumber = w.PageNumber,
-                Polygon = w.BoundingPolygon,
-                IsPixelUnit = w.IsPixelUnit
-            })
-            .ToList();
-
         _sessions.Set(sessionId, new SessionData
         {
             SessionId = sessionId,
             FilePath = filePath,
             OriginalFileName = file.FileName,
-            Entities = entities,
-            Words = wordList
+            Status = "processing",
+            Phase = "extracting"
         });
 
-        return Ok(new UploadResponse
+        // Phase 2: fire and forget — in the real project this becomes an Azure Function trigger
+        _ = Task.Run(() => ProcessUploadAsync(sessionId, filePath, file.FileName, _scopeFactory));
+
+        return Ok(new UploadAcceptedResponse
         {
             SessionId = sessionId,
             OriginalFileName = file.FileName,
-            Entities = entities
+            Status = "processing"
         });
+    }
+
+    /// <summary>Poll this after upload to check if background processing has finished.</summary>
+    [HttpGet("{sessionId}/status")]
+    public ActionResult<UploadStatusResponse> GetUploadStatus(string sessionId)
+    {
+        var session = _sessions.Get(sessionId);
+        if (session is null) return NotFound("Session not found.");
+
+        return Ok(new UploadStatusResponse
+        {
+            Status = session.Status,
+            Phase = session.Phase,
+            ErrorMessage = session.ErrorMessage,
+            Entities = session.Status == "ready" ? session.Entities : null,
+            OriginalFileName = session.Status == "ready" ? session.OriginalFileName : null
+        });
+    }
+
+    private async Task ProcessUploadAsync(string sessionId, string filePath, string originalFileName, IServiceScopeFactory scopeFactory)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var docIntelligence = scope.ServiceProvider.GetRequiredService<IDocumentIntelligenceService>();
+        var piiDetection = scope.ServiceProvider.GetRequiredService<IPiiDetectionService>();
+        var sessions = scope.ServiceProvider.GetRequiredService<SessionStore>();
+        var logger = scope.ServiceProvider.GetRequiredService<ILogger<RedactionController>>();
+
+        var session = sessions.Get(sessionId);
+        if (session is null) return;
+
+        try
+        {
+            session.Phase = "extracting";
+            logger.LogInformation("Background: starting DI extraction for session {Id}", sessionId);
+            var extraction = await docIntelligence.AnalyzeDocumentAsync(filePath);
+
+            session.Phase = "detecting";
+            logger.LogInformation("Background: starting PII detection for session {Id}", sessionId);
+            var entities = await piiDetection.DetectPiiAsync(extraction.FullText, extraction.Words, extraction.Pages);
+
+            var wordList = extraction.Words
+                .GroupBy(w => w.Content.ToLowerInvariant())
+                .Select(g => g.First())
+                .Select(w => new WordSearchResult
+                {
+                    Text = w.Content,
+                    PageNumber = w.PageNumber,
+                    Polygon = w.BoundingPolygon,
+                    IsPixelUnit = w.IsPixelUnit
+                })
+                .ToList();
+
+            session.Entities = entities;
+            session.Words = wordList;
+            session.Phase = string.Empty;
+            session.Status = "ready";
+
+            logger.LogInformation("Background: processing complete for session {Id} — {Count} entities", sessionId, entities.Count);
+        }
+        catch (Exception ex)
+        {
+            session.Status = "error";
+            session.Phase = string.Empty;
+            session.ErrorMessage = ex.Message;
+            logger.LogError(ex, "Background: processing failed for session {Id}", sessionId);
+        }
     }
 
     /// <summary>

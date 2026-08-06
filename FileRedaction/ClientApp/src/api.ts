@@ -1,12 +1,17 @@
 import axios from 'axios'
-import type { UploadResponse, PreviewResponse, PiiEntity } from './types'
+import type { UploadAcceptedResponse, UploadStatusResponse, PreviewResponse, PiiEntity } from './types'
 
 const http = axios.create({ baseURL: '/api/redaction' })
 
-export async function uploadFile(file: File): Promise<UploadResponse> {
+export async function uploadFile(file: File): Promise<UploadAcceptedResponse> {
   const form = new FormData()
   form.append('file', file)
-  const { data } = await http.post<UploadResponse>('/upload', form)
+  const { data } = await http.post<UploadAcceptedResponse>('/upload', form)
+  return data
+}
+
+export async function getUploadStatus(sessionId: string): Promise<UploadStatusResponse> {
+  const { data } = await http.get<UploadStatusResponse>(`/${sessionId}/status`)
   return data
 }
 

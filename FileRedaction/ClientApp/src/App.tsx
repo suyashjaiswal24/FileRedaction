@@ -1,30 +1,74 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import FileUpload from './components/FileUpload'
 import EntitySelector from './components/EntitySelector'
 import DocumentPreview from './components/DocumentPreview'
-import type { UploadResponse } from './types'
+import { getUploadStatus } from './api'
+import type { UploadResponse, UploadAcceptedResponse } from './types'
 
-type Step = 'upload' | 'select' | 'preview' | 'done'
+type Step = 'upload' | 'processing' | 'select' | 'preview' | 'done'
 
 const STEPS = ['Upload', 'Select PII', 'Preview', 'Redact']
+
+const PHASE_LABELS: Record<string, string> = {
+  extracting: 'Extracting text with Azure Document Intelligence…',
+  detecting: 'Detecting PII entities…',
+  '': 'Finalising…'
+}
 
 export default function App() {
   const [step, setStep] = useState<Step>('upload')
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [processingSession, setProcessingSession] = useState<{ sessionId: string; originalFileName: string } | null>(null)
+  const [processingPhase, setProcessingPhase] = useState<string>('extracting')
+  const [processingError, setProcessingError] = useState<string>('')
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   function handleEntityAdded(entity: import('./types').PiiEntity) {
     if (!uploadResult) return
     setUploadResult({ ...uploadResult, entities: [...uploadResult.entities, entity] })
   }
 
-  const stepIndex: Record<Step, number> = { upload: 0, select: 1, preview: 2, done: 3 }
+  const stepIndex: Record<Step, number> = { upload: 0, processing: 0, select: 1, preview: 2, done: 3 }
 
-  function handleUploaded(result: UploadResponse) {
-    setUploadResult(result)
-    setSelectedIds(new Set(result.entities.map(e => e.id)))
-    setStep('select')
+  function handleUploaded(result: UploadAcceptedResponse) {
+    setProcessingSession({ sessionId: result.sessionId, originalFileName: result.originalFileName })
+    setProcessingPhase('extracting')
+    setProcessingError('')
+    setStep('processing')
   }
+
+  // Poll for background processing status
+  useEffect(() => {
+    if (step !== 'processing' || !processingSession) return
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const status = await getUploadStatus(processingSession.sessionId)
+        setProcessingPhase(status.phase ?? '')
+
+        if (status.status === 'ready' && status.entities) {
+          clearInterval(pollRef.current!)
+          const result: UploadResponse = {
+            sessionId: processingSession.sessionId,
+            originalFileName: processingSession.originalFileName,
+            entities: status.entities
+          }
+          setUploadResult(result)
+          setSelectedIds(new Set(status.entities.map(e => e.id)))
+          setStep('select')
+        } else if (status.status === 'error') {
+          clearInterval(pollRef.current!)
+          setProcessingError(status.errorMessage ?? 'Processing failed. Please try again.')
+          setStep('upload')
+        }
+      } catch {
+        // transient network error — will retry on next tick
+      }
+    }, 2000)
+
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [step, processingSession])
 
   return (
     <div style={styles.root}>
@@ -65,7 +109,20 @@ export default function App() {
       {/* Content */}
       <main style={styles.main}>
         {step === 'upload' && (
-          <FileUpload onUploadComplete={handleUploaded} />
+          <FileUpload onUploadComplete={handleUploaded} initialError={processingError} />
+        )}
+
+        {step === 'processing' && processingSession && (
+          <div style={{ maxWidth: 480, margin: '80px auto', textAlign: 'center' }}>
+            <div style={styles.doneCard}>
+              <div style={styles.spinner} />
+              <h2 style={{ fontSize: 20, fontWeight: 700, margin: '20px 0 8px' }}>Analysing document…</h2>
+              <p style={{ color: '#555', fontSize: 14 }}>
+                {PHASE_LABELS[processingPhase] ?? PHASE_LABELS['']}
+              </p>
+              <p style={{ color: '#aaa', fontSize: 12, marginTop: 8 }}>{processingSession.originalFileName}</p>
+            </div>
+          </div>
         )}
 
         {step === 'select' && uploadResult && (
@@ -157,6 +214,10 @@ const styles: Record<string, React.CSSProperties> = {
   doneIcon: {
     width: 72, height: 72, borderRadius: '50%', background: '#dcfce7',
     display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px'
+  },
+  spinner: {
+    width: 48, height: 48, border: '4px solid #e0e7ff', borderTop: '4px solid #4f7ef8',
+    borderRadius: '50%', animation: 'spin 0.8s linear infinite', margin: '0 auto'
   },
   primaryBtn: {
     background: '#4f7ef8', color: '#fff', border: 'none', borderRadius: 10,

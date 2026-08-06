@@ -1,5 +1,24 @@
 namespace FileRedaction.Models;
 
+/// <summary>Returned immediately from POST /upload — processing continues in background.</summary>
+public class UploadAcceptedResponse
+{
+    public string SessionId { get; set; } = string.Empty;
+    public string OriginalFileName { get; set; } = string.Empty;
+    public string Status { get; set; } = "processing";
+}
+
+/// <summary>Returned by GET /{sessionId}/status while polling.</summary>
+public class UploadStatusResponse
+{
+    public string Status { get; set; } = string.Empty;   // processing | ready | error
+    public string Phase { get; set; } = string.Empty;    // extracting | detecting | ""
+    public string? ErrorMessage { get; set; }
+    public List<PiiEntityResult>? Entities { get; set; }
+    public string? OriginalFileName { get; set; }
+}
+
+/// <summary>Legacy shape kept for internal use (EntitySelector, preview, etc.).</summary>
 public class UploadResponse
 {
     public string SessionId { get; set; } = string.Empty;
@@ -47,6 +66,11 @@ public class SessionData
     public List<PiiEntityResult> Entities { get; set; } = new();
     // Raw DI words — kept for manual search and image bounding-box lookup
     public List<WordSearchResult> Words { get; set; } = new();
+
+    // Background processing state
+    public string Status { get; set; } = "processing"; // processing | ready | error
+    public string Phase { get; set; } = string.Empty;  // extracting | detecting | ""
+    public string? ErrorMessage { get; set; }
 }
 
 public class AddEntityRequest
