@@ -1,0 +1,165 @@
+import { useState } from 'react'
+import FileUpload from './components/FileUpload'
+import EntitySelector from './components/EntitySelector'
+import DocumentPreview from './components/DocumentPreview'
+import type { UploadResponse } from './types'
+
+type Step = 'upload' | 'select' | 'preview' | 'done'
+
+const STEPS = ['Upload', 'Select PII', 'Preview', 'Redact']
+
+export default function App() {
+  const [step, setStep] = useState<Step>('upload')
+  const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+
+  function handleEntityAdded(entity: import('./types').PiiEntity) {
+    if (!uploadResult) return
+    setUploadResult({ ...uploadResult, entities: [...uploadResult.entities, entity] })
+  }
+
+  const stepIndex: Record<Step, number> = { upload: 0, select: 1, preview: 2, done: 3 }
+
+  function handleUploaded(result: UploadResponse) {
+    setUploadResult(result)
+    setSelectedIds(new Set(result.entities.map(e => e.id)))
+    setStep('select')
+  }
+
+  return (
+    <div style={styles.root}>
+      {/* Top bar */}
+      <header style={styles.topbar}>
+        <div style={styles.brand}>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4f7ef8" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round"
+              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          <span style={styles.brandName}>File Redaction POC</span>
+        </div>
+
+        <nav style={styles.stepper}>
+          {STEPS.map((label, i) => {
+            const current = stepIndex[step]
+            const active = i <= current
+            const isCurrent = i === current
+            return (
+              <div key={label} style={styles.stepItem}>
+                {i > 0 && <div style={{ ...styles.connector, background: active ? '#4f7ef8' : '#e0e0e0' }} />}
+                <div style={{ ...styles.stepCircle, ...(active ? styles.stepCircleActive : {}), ...(isCurrent ? styles.stepCircleCurrent : {}) }}>
+                  {i < current ? (
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#fff" strokeWidth={2}>
+                      <path d="M2 6l3 3 5-5" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  ) : (
+                    <span style={{ fontSize: 11, fontWeight: 700 }}>{i + 1}</span>
+                  )}
+                </div>
+                <span style={{ ...styles.stepLabel, ...(active ? styles.stepLabelActive : {}) }}>{label}</span>
+              </div>
+            )
+          })}
+        </nav>
+      </header>
+
+      {/* Content */}
+      <main style={styles.main}>
+        {step === 'upload' && (
+          <FileUpload onUploadComplete={handleUploaded} />
+        )}
+
+        {step === 'select' && uploadResult && (
+          <EntitySelector
+            sessionId={uploadResult.sessionId}
+            entities={uploadResult.entities}
+            selectedIds={selectedIds}
+            onSelectionChange={setSelectedIds}
+            onEntityAdded={handleEntityAdded}
+            onNext={() => setStep('preview')}
+            fileName={uploadResult.originalFileName}
+          />
+        )}
+
+        {step === 'preview' && uploadResult && (
+          <DocumentPreview
+            sessionId={uploadResult.sessionId}
+            selectedEntityIds={[...selectedIds]}
+            selectedCount={selectedIds.size}
+            fileName={uploadResult.originalFileName}
+            onBack={() => setStep('select')}
+            onDone={() => setStep('done')}
+          />
+        )}
+
+        {step === 'done' && (
+          <div style={{ maxWidth: 480, margin: '80px auto', textAlign: 'center' }}>
+            <div style={styles.doneCard}>
+              <div style={styles.doneIcon}>
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>Redaction Complete</h2>
+              <p style={{ color: '#555', marginBottom: 28, fontSize: 15 }}>
+                Your redacted PDF has been downloaded. Selected PII regions have been permanently blacked out using Aspose.PDF.
+              </p>
+              <button
+                style={styles.primaryBtn}
+                onClick={() => { setStep('upload'); setUploadResult(null); setSelectedIds(new Set()) }}
+              >
+                Redact Another Document
+              </button>
+            </div>
+          </div>
+        )}
+      </main>
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+      `}</style>
+    </div>
+  )
+}
+
+const styles: Record<string, React.CSSProperties> = {
+  root: { minHeight: '100vh', display: 'flex', flexDirection: 'column' },
+  topbar: {
+    background: '#fff',
+    boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
+    padding: '0 40px',
+    height: 64,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    position: 'sticky',
+    top: 0,
+    zIndex: 10
+  },
+  brand: { display: 'flex', alignItems: 'center', gap: 10 },
+  brandName: { fontWeight: 700, fontSize: 18, color: '#1a1a2e' },
+  stepper: { display: 'flex', alignItems: 'center', gap: 0 },
+  stepItem: { display: 'flex', alignItems: 'center', gap: 6 },
+  connector: { width: 32, height: 2, borderRadius: 1 },
+  stepCircle: {
+    width: 26, height: 26, borderRadius: '50%',
+    background: '#e0e0e0', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    color: '#999', transition: 'all 0.2s'
+  },
+  stepCircleActive: { background: '#4f7ef8', color: '#fff' },
+  stepCircleCurrent: { boxShadow: '0 0 0 3px #c7d9ff' },
+  stepLabel: { fontSize: 13, color: '#aaa', marginRight: 4, whiteSpace: 'nowrap' },
+  stepLabelActive: { color: '#4f7ef8', fontWeight: 600 },
+  main: { flex: 1, padding: '0 16px 40px' },
+  doneCard: {
+    background: '#fff', borderRadius: 16, padding: '48px 40px',
+    boxShadow: '0 4px 24px rgba(0,0,0,0.08)'
+  },
+  doneIcon: {
+    width: 72, height: 72, borderRadius: '50%', background: '#dcfce7',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 20px'
+  },
+  primaryBtn: {
+    background: '#4f7ef8', color: '#fff', border: 'none', borderRadius: 10,
+    padding: '12px 28px', fontWeight: 600, fontSize: 15, cursor: 'pointer'
+  }
+}
