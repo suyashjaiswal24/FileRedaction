@@ -10,6 +10,10 @@ builder.Services.AddScoped<IPiiDetectionService, PiiDetectionService>();
 builder.Services.AddScoped<IRedactionService, RedactionService>();
 builder.Services.AddSingleton<IOfficeConversionService, OfficeConversionService>();
 
+builder.Services.AddSingleton<AudioSessionStore>();
+builder.Services.AddScoped<IAudioTranscriptionService, AudioTranscriptionService>();
+builder.Services.AddScoped<IAudioRedactionService, AudioRedactionService>();
+
 // Named HttpClient for the Azure AI Language Service (PII detection)
 builder.Services.AddHttpClient(nameof(PiiDetectionService), (sp, client) =>
 {

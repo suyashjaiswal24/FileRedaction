@@ -2,10 +2,12 @@ import { useState, useEffect, useRef } from 'react'
 import FileUpload from './components/FileUpload'
 import EntitySelector from './components/EntitySelector'
 import DocumentPreview from './components/DocumentPreview'
+import AudioRedaction from './components/AudioRedaction'
 import { getUploadStatus } from './api'
 import type { UploadResponse, UploadAcceptedResponse, PreviewResponse } from './types'
 
 type Step = 'upload' | 'processing' | 'select' | 'preview' | 'done'
+type Mode = 'document' | 'audio'
 
 const STEPS = ['Upload', 'Select PII', 'Preview', 'Redact']
 
@@ -16,6 +18,7 @@ const PHASE_LABELS: Record<string, string> = {
 }
 
 export default function App() {
+  const [mode, setMode] = useState<Mode>('document')
   const [step, setStep] = useState<Step>('upload')
   const [uploadResult, setUploadResult] = useState<UploadResponse | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
@@ -37,6 +40,18 @@ export default function App() {
   }
 
   const stepIndex: Record<Step, number> = { upload: 0, processing: 0, select: 1, preview: 2, done: 3 }
+
+  function switchMode(m: Mode) {
+    setMode(m)
+    // Reset document state when switching away
+    if (m === 'audio') {
+      setStep('upload')
+      setUploadResult(null)
+      setSelectedIds(new Set())
+      setProcessingError('')
+      if (pollRef.current) clearInterval(pollRef.current)
+    }
+  }
 
   function handleUploaded(result: UploadAcceptedResponse) {
     setProcessingSession({ sessionId: result.sessionId, originalFileName: result.originalFileName })
@@ -81,12 +96,36 @@ export default function App() {
     <div style={styles.root}>
       {/* Top bar */}
       <header style={styles.topbar}>
-        <div style={styles.brand}>
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4f7ef8" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round"
-              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-          </svg>
-          <span style={styles.brandName}>File Redaction POC</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
+          <div style={styles.brand}>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4f7ef8" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round"
+                d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+            </svg>
+            <span style={styles.brandName}>File Redaction POC</span>
+          </div>
+
+          {/* Mode tabs */}
+          <div style={{ display: 'flex', gap: 4, background: '#f0f0f0', borderRadius: 8, padding: 3 }}>
+            <button
+              onClick={() => switchMode('document')}
+              style={{
+                ...styles.modeTab,
+                ...(mode === 'document' ? styles.modeTabActive : {})
+              }}
+            >
+              Documents
+            </button>
+            <button
+              onClick={() => switchMode('audio')}
+              style={{
+                ...styles.modeTab,
+                ...(mode === 'audio' ? styles.modeTabActive : {})
+              }}
+            >
+              Audio
+            </button>
+          </div>
         </div>
 
         <nav style={styles.stepper}>
@@ -115,11 +154,15 @@ export default function App() {
 
       {/* Content */}
       <main style={styles.main}>
-        {step === 'upload' && (
+        {mode === 'audio' && (
+          <AudioRedaction onBack={() => switchMode('document')} />
+        )}
+
+        {mode === 'document' && step === 'upload' && (
           <FileUpload onUploadComplete={handleUploaded} initialError={processingError} />
         )}
 
-        {step === 'processing' && processingSession && (
+        {mode === 'document' && step === 'processing' && processingSession && (
           <div style={{ maxWidth: 480, margin: '80px auto', textAlign: 'center' }}>
             <div style={styles.doneCard}>
               <div style={styles.spinner} />
@@ -132,7 +175,7 @@ export default function App() {
           </div>
         )}
 
-        {step === 'select' && uploadResult && (
+        {mode === 'document' && step === 'select' && uploadResult && (
           <EntitySelector
             sessionId={uploadResult.sessionId}
             entities={uploadResult.entities}
@@ -144,7 +187,7 @@ export default function App() {
           />
         )}
 
-        {step === 'preview' && uploadResult && (
+        {mode === 'document' && step === 'preview' && uploadResult && (
           <DocumentPreview
             sessionId={uploadResult.sessionId}
             selectedEntityIds={[...selectedIds]}
@@ -157,7 +200,7 @@ export default function App() {
           />
         )}
 
-        {step === 'done' && (
+        {mode === 'document' && step === 'done' && (
           <div style={{ maxWidth: 480, margin: '80px auto', textAlign: 'center' }}>
             <div style={styles.doneCard}>
               <div style={styles.doneIcon}>
@@ -203,6 +246,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   brand: { display: 'flex', alignItems: 'center', gap: 10 },
   brandName: { fontWeight: 700, fontSize: 18, color: '#1a1a2e' },
+  modeTab: {
+    background: 'none', border: 'none', borderRadius: 6, padding: '5px 14px',
+    fontSize: 13, fontWeight: 600, cursor: 'pointer', color: '#888', transition: 'all 0.15s'
+  },
+  modeTabActive: { background: '#fff', color: '#4f7ef8', boxShadow: '0 1px 4px rgba(0,0,0,0.1)' },
   stepper: { display: 'flex', alignItems: 'center', gap: 0 },
   stepItem: { display: 'flex', alignItems: 'center', gap: 6 },
   connector: { width: 32, height: 2, borderRadius: 1 },
