@@ -98,6 +98,50 @@ public class AudioRedactionController : ControllerBase
         return PhysicalFile(redactedPath, "audio/wav", fileName);
     }
 
+    [HttpGet("{sessionId}/search-words")]
+    public IActionResult SearchWords(string sessionId, [FromQuery] string q)
+    {
+        var session = _sessions.Get(sessionId);
+        if (session == null) return NotFound();
+        if (session.Status != "ready" || string.IsNullOrWhiteSpace(q) || q.Length < 2)
+            return Ok(Array.Empty<object>());
+
+        var matches = session.TranscriptWords
+            .Where(w => w.Word.Contains(q, StringComparison.OrdinalIgnoreCase))
+            .DistinctBy(w => w.Word.ToLowerInvariant())
+            .Take(10)
+            .Select(w => new { text = w.Word, offsetSeconds = w.AudioOffsetTicks / 10_000_000.0 })
+            .ToList();
+
+        return Ok(matches);
+    }
+
+    [HttpPost("{sessionId}/add-entity")]
+    public IActionResult AddEntity(string sessionId, [FromBody] AudioAddEntityRequest request)
+    {
+        var session = _sessions.Get(sessionId);
+        if (session == null) return NotFound();
+        if (session.Status != "ready") return BadRequest("Session not ready.");
+
+        var text = request.Text.Trim();
+        if (string.IsNullOrWhiteSpace(text)) return BadRequest("Text is required.");
+
+        var timeRanges = FindTimeRanges(text, session.FullTranscript, session.TranscriptWords);
+
+        var entity = new AudioPiiEntity
+        {
+            Id = Guid.NewGuid().ToString("N")[..8],
+            Text = text,
+            Category = "Manual",
+            ConfidenceScore = 1.0,
+            TimeRanges = timeRanges
+        };
+
+        session.Entities.Add(entity);
+        _logger.LogInformation("Manual entity added: '{Text}' — {Count} time range(s)", text, timeRanges.Count);
+        return Ok(entity);
+    }
+
     // ── Background processing ────────────────────────────────────────────────
     // INTEGRATION NOTE: In production this entire ProcessAsync method is replaced by a
     // Service Bus callback endpoint. The flow becomes:
@@ -158,6 +202,7 @@ public class AudioRedactionController : ControllerBase
             }).ToList();
 
             session.FullTranscript = fullTranscript;
+            session.TranscriptWords = transcriptWords;
             session.Entities = audioPiiEntities;
             session.DetectedLanguage = detectedLang;
             session.Status = "ready";
@@ -188,18 +233,28 @@ public class AudioRedactionController : ControllerBase
             if (pos < 0) break;
 
             int end = pos + entityText.Length;
-            var matching = words.Where(w => w.TextOffset < end && w.TextOffset + w.TextLength > pos).ToList();
-            if (matching.Count > 0)
+            if (IsWordBoundary(fullTranscript, pos, entityText.Length))
             {
-                ranges.Add(new AudioTimeRange
+                var matching = words.Where(w => w.TextOffset < end && w.TextOffset + w.TextLength > pos).ToList();
+                if (matching.Count > 0)
                 {
-                    StartTicks = matching.Min(w => w.AudioOffsetTicks),
-                    EndTicks   = matching.Max(w => w.AudioOffsetTicks + w.AudioDurationTicks)
-                });
+                    ranges.Add(new AudioTimeRange
+                    {
+                        StartTicks = matching.Min(w => w.AudioOffsetTicks),
+                        EndTicks   = matching.Max(w => w.AudioOffsetTicks + w.AudioDurationTicks)
+                    });
+                }
             }
             searchFrom = pos + 1;
         }
 
         return ranges;
+    }
+
+    private static bool IsWordBoundary(string text, int pos, int len)
+    {
+        bool before = pos == 0 || !char.IsLetterOrDigit(text[pos - 1]);
+        bool after  = pos + len >= text.Length || !char.IsLetterOrDigit(text[pos + len]);
+        return before && after;
     }
 }

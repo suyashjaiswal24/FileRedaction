@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, KeyboardEvent } from 'react'
 
 interface AudioPiiEntity {
   id: string
@@ -38,21 +38,29 @@ function getCategoryColor(cat: string): string {
   return CATEGORY_COLORS[cat] ?? CATEGORY_COLORS.Default
 }
 
+function isWordBoundary(text: string, pos: number, len: number): boolean {
+  const before = pos === 0 || !/\w/.test(text[pos - 1])
+  const after = pos + len >= text.length || !/\w/.test(text[pos + len])
+  return before && after
+}
+
 function buildHighlightedTranscript(
   transcript: string,
   entities: AudioPiiEntity[],
   selectedIds: Set<string>
 ): React.ReactNode[] {
-  // Build a list of [start, end, entityId] spans to highlight
   const spans: { start: number; end: number; entity: AudioPiiEntity }[] = []
+  const lower = transcript.toLowerCase()
 
   for (const entity of entities) {
     if (!selectedIds.has(entity.id)) continue
+    const needle = entity.text.toLowerCase()
     let searchFrom = 0
     while (true) {
-      const pos = transcript.toLowerCase().indexOf(entity.text.toLowerCase(), searchFrom)
+      const pos = lower.indexOf(needle, searchFrom)
       if (pos < 0) break
-      spans.push({ start: pos, end: pos + entity.text.length, entity })
+      if (isWordBoundary(lower, pos, needle.length))
+        spans.push({ start: pos, end: pos + entity.text.length, entity })
       searchFrom = pos + 1
     }
   }
@@ -117,6 +125,12 @@ const LANGUAGES = [
   { code: 'ko-KR', label: 'Korean' },
 ]
 
+function formatTime(secs: number): string {
+  const m = Math.floor(secs / 60)
+  const s = Math.floor(secs % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
 export default function AudioRedaction({ onBack }: Props) {
   const [step, setStep] = useState<Step>('upload')
   const [dragging, setDragging] = useState(false)
@@ -131,6 +145,12 @@ export default function AudioRedaction({ onBack }: Props) {
   const [redactedFileName, setRedactedFileName] = useState<string>('')
   const [isRedacting, setIsRedacting] = useState(false)
   const [uploadProgress, setUploadProgress] = useState<string>('')
+  const [manualWord, setManualWord] = useState('')
+  const [isAddingWord, setIsAddingWord] = useState(false)
+  const [wordMatches, setWordMatches] = useState<{ text: string; offsetSeconds: number }[]>([])
+  const [showDropdown, setShowDropdown] = useState(false)
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const dropdownRef = useRef<HTMLDivElement>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -172,6 +192,32 @@ export default function AudioRedaction({ onBack }: Props) {
 
     return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [step, sessionId])
+
+  // Debounced word search for manual input
+  useEffect(() => {
+    if (searchTimer.current) clearTimeout(searchTimer.current)
+    if (manualWord.trim().length < 2 || !sessionId) { setWordMatches([]); setShowDropdown(false); return }
+    searchTimer.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/audio/${sessionId}/search-words?q=${encodeURIComponent(manualWord.trim())}`)
+        if (!res.ok) return
+        const matches = await res.json()
+        setWordMatches(matches)
+        setShowDropdown(matches.length > 0)
+      } catch { setWordMatches([]); setShowDropdown(false) }
+    }, 300)
+    return () => { if (searchTimer.current) clearTimeout(searchTimer.current) }
+  }, [manualWord, sessionId])
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node))
+        setShowDropdown(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
 
   const handleFile = useCallback(async (file: File) => {
     setErrorMsg('')
@@ -219,6 +265,43 @@ export default function AudioRedaction({ onBack }: Props) {
       else next.add(id)
       return next
     })
+  }
+
+  const handleAddWord = async (textOverride?: string) => {
+    const text = (textOverride ?? manualWord).trim()
+    if (!text || isAddingWord) return
+    setIsAddingWord(true)
+    setShowDropdown(false)
+    setWordMatches([])
+    try {
+      const res = await fetch(`/api/audio/${sessionId}/add-entity`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text })
+      })
+      if (!res.ok) {
+        const msg = await res.text()
+        setErrorMsg(msg || 'Failed to add word.')
+        return
+      }
+      const entity: AudioPiiEntity = await res.json()
+      setEntities(prev => [...prev, entity])
+      setSelectedIds(prev => new Set([...prev, entity.id]))
+      setManualWord('')
+      if (entity.timeRanges.length === 0)
+        setErrorMsg(`"${text}" was added but not found in the transcript — it won't beep.`)
+      else
+        setErrorMsg('')
+    } catch {
+      setErrorMsg('Network error.')
+    } finally {
+      setIsAddingWord(false)
+    }
+  }
+
+  function onManualKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') handleAddWord()
+    if (e.key === 'Escape') setShowDropdown(false)
   }
 
   const handleRedact = async () => {
@@ -429,7 +512,61 @@ export default function AudioRedaction({ onBack }: Props) {
                 </div>
               )}
 
-              <div style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={styles.manualSection} ref={dropdownRef}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="#92400e" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" />
+                  </svg>
+                  <span style={{ fontWeight: 600, fontSize: 12, color: '#92400e' }}>Add words manually</span>
+                </div>
+                <div style={{ position: 'relative' }}>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <input
+                      type="text"
+                      placeholder="Type to search transcript words…"
+                      value={manualWord}
+                      onChange={e => { setManualWord(e.target.value) }}
+                      onKeyDown={onManualKeyDown}
+                      onFocus={() => wordMatches.length > 0 && setShowDropdown(true)}
+                      disabled={isAddingWord}
+                      style={styles.manualInput}
+                    />
+                    <button
+                      onClick={() => handleAddWord()}
+                      disabled={!manualWord.trim() || isAddingWord}
+                      style={{
+                        ...styles.addBtn,
+                        opacity: (!manualWord.trim() || isAddingWord) ? 0.5 : 1,
+                        cursor: (!manualWord.trim() || isAddingWord) ? 'not-allowed' : 'pointer'
+                      }}
+                    >
+                      {isAddingWord ? '…' : '+ Add'}
+                    </button>
+                  </div>
+
+                  {showDropdown && (
+                    <div style={styles.dropdown}>
+                      <div style={styles.dropdownHint}>
+                        Words matching "{manualWord}" — click to add
+                      </div>
+                      {wordMatches.map((w, i) => (
+                        <button
+                          key={i}
+                          style={styles.dropdownItem}
+                          onMouseDown={e => { e.preventDefault(); handleAddWord(w.text) }}
+                        >
+                          <span style={{ fontWeight: 500 }}>{w.text}</span>
+                          <span style={{ fontSize: 11, color: '#999', marginLeft: 8 }}>
+                            {formatTime(w.offsetSeconds)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#888' }}>
                   <span>{selectedIds.size} of {entities.length} entities selected</span>
                   <div style={{ display: 'flex', gap: 12 }}>
@@ -666,6 +803,68 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#fff',
     cursor: 'pointer',
     outline: 'none'
+  },
+  manualSection: {
+    marginTop: 16,
+    padding: '14px 16px',
+    background: '#fffbeb',
+    borderRadius: 10,
+    border: '1px dashed #fcd34d',
+    position: 'relative' as const
+  },
+  manualInput: {
+    flex: 1,
+    padding: '8px 12px',
+    border: '1px solid #d97706',
+    borderRadius: 8,
+    fontSize: 14,
+    outline: 'none',
+    background: '#fff'
+  },
+  addBtn: {
+    padding: '8px 16px',
+    background: '#d97706',
+    color: '#fff',
+    border: 'none',
+    borderRadius: 8,
+    fontWeight: 600,
+    fontSize: 13,
+    cursor: 'pointer',
+    whiteSpace: 'nowrap' as const
+  },
+  dropdown: {
+    position: 'absolute' as const,
+    top: '100%',
+    left: 0,
+    right: 80,
+    zIndex: 100,
+    background: '#fff',
+    border: '1px solid #fcd34d',
+    borderRadius: 8,
+    boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+    maxHeight: 200,
+    overflowY: 'auto' as const,
+    marginTop: 2
+  },
+  dropdownHint: {
+    padding: '5px 12px',
+    fontSize: 11,
+    color: '#a16207',
+    background: '#fffbeb',
+    borderBottom: '1px solid #fef3c7'
+  },
+  dropdownItem: {
+    display: 'flex' as const,
+    alignItems: 'center',
+    width: '100%',
+    padding: '7px 12px',
+    background: 'none',
+    border: 'none',
+    borderBottom: '1px solid #fef9ee',
+    textAlign: 'left' as const,
+    cursor: 'pointer',
+    fontSize: 14,
+    color: '#333'
   },
   doneIcon: {
     width: 72,

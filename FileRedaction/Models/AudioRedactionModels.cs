@@ -34,6 +34,13 @@ public class AudioSessionData
     public string Status { get; set; } = "processing";          // processing | ready | error
     public string? ErrorMessage { get; set; }
     public string DetectedLanguage { get; set; } = "en";
+    // Kept after processing to support manual word addition (FindTimeRanges lookup)
+    public List<AudioTranscriptWord> TranscriptWords { get; set; } = new();
+}
+
+public class AudioAddEntityRequest
+{
+    public string Text { get; set; } = string.Empty;
 }
 
 public class AudioStatusResponse
