@@ -8,7 +8,7 @@ namespace FileRedaction.Services;
 
 public interface IPiiDetectionService
 {
-    Task<List<PiiEntityResult>> DetectPiiAsync(string fullText, List<WordInfo> words, List<PageInfo> pages);
+    Task<List<PiiEntityResult>> DetectPiiAsync(string fullText, List<WordInfo> words, List<PageInfo> pages, string language = "en");
 }
 
 /// <summary>
@@ -53,13 +53,13 @@ public class PiiDetectionService : IPiiDetectionService
         _logger = logger;
     }
 
-    public async Task<List<PiiEntityResult>> DetectPiiAsync(string fullText, List<WordInfo> words, List<PageInfo> pages)
+    public async Task<List<PiiEntityResult>> DetectPiiAsync(string fullText, List<WordInfo> words, List<PageInfo> pages, string language = "en")
     {
         var chunks = SplitByPage(fullText, pages);
 
         _logger.LogInformation(
-            "═══ PII DETECTION START ═══  Total chars: {Chars}  Page-chunks: {Chunks}  URL: {Url}",
-            fullText.Length, chunks.Count, _analyzeTextUrl);
+            "═══ PII DETECTION START ═══  Total chars: {Chars}  Page-chunks: {Chunks}  Language: {Lang}  URL: {Url}",
+            fullText.Length, chunks.Count, language, _analyzeTextUrl);
 
         for (int i = 0; i < chunks.Count; i++)
         {
@@ -82,7 +82,7 @@ public class PiiDetectionService : IPiiDetectionService
             var docs = batch.Select((c, i) => new LsDocument
             {
                 Id = i.ToString(),
-                Language = "en",
+                Language = language,
                 Text = c.Text
             }).ToList();
 
@@ -314,6 +314,7 @@ public class PiiDetectionService : IPiiDetectionService
         [JsonPropertyName("language")] public string Language { get; init; } = "en";
         [JsonPropertyName("text")] public string Text { get; init; } = string.Empty;
     }
+
 
     private record LsAnalyzeResponse
     {

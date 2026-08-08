@@ -16,6 +16,8 @@ public class DocumentExtractionResult
     public List<WordInfo> Words { get; set; } = new();
     /// <summary>One entry per page, ordered by page number. Spans reference positions in FullText.</summary>
     public List<PageInfo> Pages { get; set; } = new();
+    /// <summary>ISO 639-1 code of the dominant language detected by DI (e.g. "de", "fr"). Defaults to "en".</summary>
+    public string DetectedLanguage { get; set; } = "en";
 }
 
 public class PageInfo
@@ -146,7 +148,19 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
         await File.WriteAllTextAsync(dumpPath, fullText);
         _logger.LogInformation("═══ FULL EXTRACTED TEXT saved to: {DumpPath}", dumpPath);
 
-        return new DocumentExtractionResult { FullText = fullText, Words = words, Pages = pages };
+        // Pick the highest-confidence language detected by DI across all spans
+        var detectedLanguage = result.Languages
+            .OrderByDescending(l => l.Confidence)
+            .Select(l => l.Locale)
+            .FirstOrDefault() ?? "en";
+
+        // DI returns full locale codes like "en-US" or "de-DE" — Language Service PII wants just the base "en"/"de"
+        if (detectedLanguage.Contains('-'))
+            detectedLanguage = detectedLanguage.Split('-')[0];
+
+        _logger.LogInformation("DI detected language: {Lang}", detectedLanguage);
+
+        return new DocumentExtractionResult { FullText = fullText, Words = words, Pages = pages, DetectedLanguage = detectedLanguage };
         } // end await using stream
     }
 

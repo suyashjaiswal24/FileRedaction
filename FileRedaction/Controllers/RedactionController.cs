@@ -141,7 +141,7 @@ public class RedactionController : ControllerBase
 
             session.Phase = "detecting";
             logger.LogInformation("Background: starting PII detection for session {Id}", sessionId);
-            var entities = await piiDetection.DetectPiiAsync(extraction.FullText, extraction.Words, extraction.Pages);
+            var entities = await piiDetection.DetectPiiAsync(extraction.FullText, extraction.Words, extraction.Pages, extraction.DetectedLanguage);
 
             var wordList = extraction.Words
                 .GroupBy(w => w.Content.ToLowerInvariant())
