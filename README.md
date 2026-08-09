@@ -28,30 +28,31 @@ Upload a file → the app reads it, finds sensitive info like names, phone numbe
 - Background processing starts right away (the UI does not wait).
 
 #### Step 2 — Background Processing (the heavy lifting)
-The server runs three things in order while the browser polls every 2 seconds:
 
-**Phase 1 — `extracting` — Text extraction**
+Two things run **in parallel** from the moment the file is uploaded, while the browser polls every 2 seconds:
+
+**Track A — Text extraction + PII detection (`extracting` → `detecting`)**
 
 - **Plain text (`.txt`):** File is read directly. No AI needed. Every word gets its exact character offset stored.
 - **Images (PNG, JPG, etc.):** Sent to **Azure Document Intelligence** (`prebuilt-read` model) which uses OCR to find every word and its pixel position on the image.
-  - If the image is larger than 4 MB, it is compressed (resized to ~90% of size) before sending to DI, then the pixel coordinates are scaled back to the original image size so highlights land in the right place.
-- **PDFs:** Sent to **Azure Document Intelligence** which extracts text with exact bounding box coordinates in points (1 point = 1/72 inch).
+  - If the image is larger than 4 MB, it is compressed (resized) before sending to DI, then the pixel coordinates are scaled back to the original image size so highlights land in the right place.
+- **PDFs:** Sent to **Azure Document Intelligence** which extracts text with exact bounding box coordinates in points (1 point = 1/72 inch). DI processes all pages internally in one API call — Azure's servers handle per-page parallelism server-side.
 - **Office files (Word, Excel, PowerPoint):** Also sent to Azure Document Intelligence. Additionally, they are lazily converted to PDF using **Aspose** the first time a preview is needed.
 
-**Phase 2 — `detecting` — PII detection**
+Once DI finishes, the extracted text is sent to **Azure AI Language Service** for PII detection. The Language Service returns entities (Person, PhoneNumber, Email, IBAN, etc.) with category, confidence score, and exact character offset + length. If an entity appears multiple times, all occurrences are tracked.
 
-- The full extracted text is sent to **Azure AI Language Service** (PII detection endpoint).
-- The Language Service returns a list of entities: each entity has a category (Person, PhoneNumber, Email, CreditCardNumber, IBAN, etc.), a confidence score, and the exact character offset + length in the text.
-- These offsets are used later to highlight/redact the right positions in the document.
-- If an entity appears multiple times, all occurrences are tracked (deduplication keeps the best confidence score and merges all character ranges).
+**Track B — Face detection (optional, runs in parallel with Track A)**
 
-**Phase 3 — `detecting_faces` — Face detection (optional)**
+- Starts at the same time as DI — it only needs the original file, not the DI output.
+- Face API is fast (~300 ms per image). DI is slow (3–10 s for a typical document). By the time DI + PII finish, the face results are almost always already waiting.
+- For image files: sent directly to **Azure Face API** (up to 6 MB limit).
+- For PDFs: each page is rendered to PNG at 150 DPI using **Aspose.PDF**, then all pages are sent to the Face API **in parallel** (`Task.WhenAll`). This is important for scanned government documents (Aadhaar, PAN card) which are almost always uploaded as PDFs — the face photo in the scan is detected alongside the text PII.
+- Each detected face becomes a "Face #1", "Face #2" etc. entity.
+- Face detection failures are non-fatal — the app continues without faces if the API is unavailable.
 
-- Runs only if **Azure Face API** credentials are configured.
-- For image files: the image is sent directly to the Face API (up to 6 MB limit).
-- For PDFs: each page is rendered to a PNG at 150 DPI using **Aspose.PDF**, then each PNG is sent to the Face API. Pixel coordinates returned by the Face API are converted to PDF point coordinates.
-- Each detected face becomes a "Face #1", "Face #2" etc. entity that appears in the entity list just like any PII entity.
-- Face detection failures are non-fatal — the app continues without faces if the API is unavailable or fails.
+**Why DI pages cannot be parallelised further:** DI takes the whole document as one API call. Splitting a PDF into individual pages and sending N separate calls would produce wrong character offsets (each page would restart at 0), break language detection, and add N round-trip overheads instead of 1. Azure already parallelises pages internally on their servers.
+
+**Why PII does not depend on face output:** PII detection works purely on text. Face detection finds pixel rectangles in images — completely unrelated to text. Both sets of results are merged only at the very end before the session is marked ready.
 
 #### Step 3 — Review Entities
 - The browser receives the list of all detected entities.
@@ -271,6 +272,12 @@ FileRedaction/
 
 ## Key Technical Details
 
+### Why DI and Face API run in parallel (not sequentially)
+Face detection only needs the original file path — it has no dependency on DI's output. DI is the slow step (3–10 s); Face API is fast (~300 ms per image). Starting both at `t=0` means face results are ready and waiting long before DI + PII finish. PII detection does depend on DI output (it needs the extracted text), so it starts only after DI completes. Final entities = PII results + face results, merged at the end.
+
+### Why DI pages cannot be parallelised from our side
+Azure DI accepts the whole document as a single API call and parallelises pages internally on Azure's servers. If we split a PDF into individual pages and sent N separate calls: (1) each page's text would start at character offset 0, breaking the offset-based PII and redaction logic; (2) language detection would be less accurate per-page; (3) N round-trip API overheads instead of 1. It would be slower, not faster.
+
 ### Why coordinates need scaling (images)
 Azure Document Intelligence has a 4 MB limit for images on the free tier. Large images (e.g. a 5 MB photo of an ID card) are compressed to JPEG before being sent to DI. DI returns word positions relative to the compressed image. The app captures the original image dimensions before compression and scales all returned coordinates back up — so when Aspose draws black boxes, they land on the right pixels in the original image.
 
@@ -299,7 +306,7 @@ The 1 kHz tone is a pure sine wave: `sample = sin(2π × 1000 × t)` at amplitud
 - **Document upload cap:** 20 MB (configurable in `RedactionController.cs`).
 - **Video upload cap:** 500 MB (Kestrel limit in `Program.cs`).
 - **Face detection image cap:** 6 MB (Azure Face API hardware limit — images larger than this are skipped with a warning).
-- **TXT and Excel face detection:** Not supported — face detection only runs on image files and PDFs.
+- **TXT, Excel, Word, PowerPoint face detection:** Not supported — face detection only runs on image files and PDFs.
 - **Audio format:** Redacted output is always WAV (16 kHz 16-bit mono). The original input format is not preserved.
 - **Manual entity addition for TXT:** Manual words are added as "Manual" category entities but do not have character offsets — they fall back to case-insensitive text search at redaction time.
 - **Session storage:** Sessions are in-memory only. Restarting the server clears all sessions. Temp files are written to the OS temp directory and are not cleaned up automatically.

@@ -137,10 +137,23 @@ public class RedactionController : ControllerBase
         try
         {
             session.Phase = "extracting";
-            logger.LogInformation("Background: starting DI extraction for session {Id}", sessionId);
-            var extraction = Path.GetExtension(filePath).Equals(".txt", StringComparison.OrdinalIgnoreCase)
-                ? ExtractFromPlainText(filePath)
-                : await docIntelligence.AnalyzeDocumentAsync(filePath);
+            logger.LogInformation("Background: starting DI extraction + face detection in parallel for session {Id}", sessionId);
+
+            var isTxt = Path.GetExtension(filePath).Equals(".txt", StringComparison.OrdinalIgnoreCase);
+
+            // DI and face detection are independent — start both at the same time.
+            // DI processes full text (slow, 3–10 s). Face API only looks for face rectangles (fast, ~300 ms).
+            // By the time DI + PII finish, face results are almost certainly already waiting.
+            var diTask = isTxt
+                ? Task.FromResult(ExtractFromPlainText(filePath))
+                : docIntelligence.AnalyzeDocumentAsync(filePath);
+
+            var faceTask = faceDetection.IsConfigured
+                ? SafeDetectFacesAsync(filePath, faceDetection, logger)
+                : Task.FromResult<List<PiiEntityResult>>([]);
+
+            // PII detection depends on DI output — await DI first, then start PII
+            var extraction = await diTask;
 
             session.Phase = "detecting";
             logger.LogInformation("Background: starting PII detection for session {Id}", sessionId);
@@ -158,24 +171,12 @@ public class RedactionController : ControllerBase
                 })
                 .ToList();
 
-            // Face detection — runs after PII; failures are non-fatal
-            if (faceDetection.IsConfigured)
+            // Face task is likely already done; await just collects the result
+            var faceEntities = await faceTask;
+            if (faceEntities.Count > 0)
             {
-                session.Phase = "detecting_faces";
-                logger.LogInformation("Background: starting face detection for session {Id}", sessionId);
-                try
-                {
-                    var faceEntities = await DetectFacesAsync(filePath, faceDetection, logger);
-                    if (faceEntities.Count > 0)
-                    {
-                        entities = [..entities, ..faceEntities];
-                        logger.LogInformation("Background: {Count} face(s) detected for session {Id}", faceEntities.Count, sessionId);
-                    }
-                }
-                catch (Exception fex)
-                {
-                    logger.LogWarning(fex, "Face detection failed for session {Id} — continuing without faces", sessionId);
-                }
+                entities = [..entities, ..faceEntities];
+                logger.LogInformation("Background: {Count} face(s) detected for session {Id}", faceEntities.Count, sessionId);
             }
 
             session.Entities = entities;
@@ -216,32 +217,44 @@ public class RedactionController : ControllerBase
 
         if (ext == ".pdf")
         {
-            const float renderDpi   = 150f;
-            const float ptsPerInch  = 72f;
-            float       scaleToPts  = ptsPerInch / renderDpi;
+            const float renderDpi  = 150f;
+            const float ptsPerInch = 72f;
+            float       scaleToPts = ptsPerInch / renderDpi;
 
-            var results = new List<PiiEntityResult>();
+            using var doc       = new Aspose.Pdf.Document(filePath);
+            var resolution      = new Aspose.Pdf.Devices.Resolution((int)renderDpi);
+            var pngDevice       = new Aspose.Pdf.Devices.PngDevice(resolution);
+            int pageCount       = doc.Pages.Count;
+
+            // Render all pages to memory up-front, then fire all Face API calls in parallel.
+            // Sequential calls (one await per page) would add ~0.5–1 s per page for a multi-page PDF.
+            var pageStreams  = new MemoryStream[pageCount];
+            var pageHeights = new float[pageCount];
+
+            for (int i = 0; i < pageCount; i++)
+            {
+                var ms = new MemoryStream();
+                pngDevice.Process(doc.Pages[i + 1], ms);
+                ms.Position    = 0;
+                pageStreams[i]  = ms;
+                pageHeights[i] = (float)doc.Pages[i + 1].Rect.Height;
+            }
+
+            var faceTasks   = pageStreams.Select(s => faceDetection.DetectFacesAsync(s)).ToArray();
+            var faceResults = await Task.WhenAll(faceTasks);
+
+            foreach (var s in pageStreams) s.Dispose();
+
+            var results   = new List<PiiEntityResult>();
             int faceIndex = 1;
 
-            using var doc = new Aspose.Pdf.Document(filePath);
-            var resolution = new Aspose.Pdf.Devices.Resolution((int)renderDpi);
-            var pngDevice  = new Aspose.Pdf.Devices.PngDevice(resolution);
-
-            for (int pageNum = 1; pageNum <= doc.Pages.Count; pageNum++)
+            for (int i = 0; i < pageCount; i++)
             {
-                using var ms = new MemoryStream();
-                pngDevice.Process(doc.Pages[pageNum], ms);
-                ms.Position = 0;
-
-                var faces = await faceDetection.DetectFacesAsync(ms);
-                if (faces.Count == 0) continue;
-
-                float pageHeightPts = (float)doc.Pages[pageNum].Rect.Height;
-
-                foreach (var f in faces)
+                float pageHeightPts = pageHeights[i];
+                foreach (var f in faceResults[i])
                 {
-                    // Convert pixel coords (at renderDpi) → Aspose.Pdf points (origin bottom-left)
-                    float x1 = f.Left * scaleToPts;
+                    // Convert pixel coords (at renderDpi) → Aspose.Pdf points (origin = bottom-left)
+                    float x1 = f.Left  * scaleToPts;
                     float x2 = (f.Left + f.Width)  * scaleToPts;
                     float y1 = pageHeightPts - (f.Top + f.Height) * scaleToPts;  // bottom
                     float y2 = pageHeightPts - f.Top * scaleToPts;               // top
@@ -254,7 +267,7 @@ public class RedactionController : ControllerBase
                         SubCategory     = string.Empty,
                         ConfidenceScore = 1.0,
                         OccurrenceCount = 1,
-                        PdfFaceBoxes    = [new PdfFaceBox { PageNumber = pageNum, X1 = x1, Y1 = y1, X2 = x2, Y2 = y2 }]
+                        PdfFaceBoxes    = [new PdfFaceBox { PageNumber = i + 1, X1 = x1, Y1 = y1, X2 = x2, Y2 = y2 }]
                     });
                 }
             }
@@ -263,6 +276,20 @@ public class RedactionController : ControllerBase
         }
 
         return [];
+    }
+
+    private static async Task<List<PiiEntityResult>> SafeDetectFacesAsync(
+        string filePath, IFaceDetectionService faceDetection, ILogger logger)
+    {
+        try
+        {
+            return await DetectFacesAsync(filePath, faceDetection, logger);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Face detection failed — continuing without faces");
+            return [];
+        }
     }
 
     private static PiiEntityResult FaceToImageEntity(FaceDetectionResult f, int index, int pageNumber) =>
