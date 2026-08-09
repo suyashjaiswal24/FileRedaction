@@ -16,6 +16,8 @@ public class UploadStatusResponse
     public string? ErrorMessage { get; set; }
     public List<PiiEntityResult>? Entities { get; set; }
     public string? OriginalFileName { get; set; }
+    public bool IsEmail { get; set; }
+    public int AttachmentCount { get; set; }
 }
 
 /// <summary>Legacy shape kept for internal use (EntitySelector, preview, etc.).</summary>
@@ -24,6 +26,8 @@ public class UploadResponse
     public string SessionId { get; set; } = string.Empty;
     public string OriginalFileName { get; set; } = string.Empty;
     public List<PiiEntityResult> Entities { get; set; } = new();
+    public bool IsEmail { get; set; }
+    public int AttachmentCount { get; set; }
 }
 
 public class PiiEntityResult
@@ -47,6 +51,8 @@ public class PiiEntityResult
     /// Image-file faces use BoundingRegions instead (IsPixelUnit = true).
     /// </summary>
     public List<PdfFaceBox> PdfFaceBoxes { get; set; } = new();
+    /// <summary>Email source label ("Email body" or attachment filename). Empty for non-email sessions.</summary>
+    public string Source { get; set; } = string.Empty;
 }
 
 /// <summary>Face bounding box in Aspose.Pdf point coordinates (72 pts/inch, origin bottom-left).</summary>
@@ -101,6 +107,18 @@ public class SessionData
     // For Excel: path to highlighted .xlsx (intermediate); for PDF/image: path to highlighted PDF/PNG
     public string? CachedHighlightWorkingPath { get; set; }
     public List<string> CachedHighlightEntityIds { get; set; } = new();
+
+    /// <summary>Populated only for email sessions. One entry per processable source (body + attachments).</summary>
+    public List<EmailSource> EmailSources { get; set; } = new();
+    public bool IsEmailSession => EmailSources.Count > 0;
+}
+
+/// <summary>One processable source within an email: the body or a single attachment.</summary>
+public class EmailSource
+{
+    public string Label { get; set; } = string.Empty;      // "Email body" | "invoice.pdf"
+    public string FilePath { get; set; } = string.Empty;   // temp file path
+    public string Extension { get; set; } = string.Empty;  // ".txt", ".pdf", etc.
 }
 
 public class AddEntityRequest

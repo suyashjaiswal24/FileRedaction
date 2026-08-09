@@ -12,6 +12,8 @@ builder.Services.AddScoped<IPiiDetectionService, PiiDetectionService>();
 builder.Services.AddScoped<IRedactionService, RedactionService>();
 builder.Services.AddSingleton<IOfficeConversionService, OfficeConversionService>();
 
+builder.Services.AddScoped<IEmailParserService, EmailParserService>();
+
 builder.Services.AddSingleton<AudioSessionStore>();
 builder.Services.AddScoped<IAudioTranscriptionService, AudioTranscriptionService>();
 builder.Services.AddScoped<IAudioRedactionService, AudioRedactionService>();

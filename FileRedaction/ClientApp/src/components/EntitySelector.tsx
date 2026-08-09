@@ -283,6 +283,11 @@ export default function EntitySelector({
                   p.{[...new Set(entity.boundingRegions.map(r => r.pageNumber))].join(',')}
                 </span>
               )}
+              {entity.source && (
+                <span style={{ fontSize: 11, color: '#6b7280', background: '#f3f4f6', padding: '1px 7px', borderRadius: 10, marginLeft: 4 }}>
+                  {entity.source === 'Email body' ? '📧 body' : `📎 ${entity.source.length > 20 ? entity.source.slice(0, 18) + '…' : entity.source}`}
+                </span>
+              )}
             </label>
           ))}
         </div>

@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using FileRedaction.Models;
 using FileRedaction.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -17,7 +18,8 @@ public class RedactionController : ControllerBase
         ".docx", ".doc", ".docm", ".odt", ".rtf",
         ".xlsx", ".xls", ".ods",
         ".pptx", ".ppt", ".odp",
-        ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"
+        ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp",
+        ".eml", ".msg"
     };
 
     private static readonly HashSet<string> ImageExtensions =
@@ -118,7 +120,9 @@ public class RedactionController : ControllerBase
             Phase = session.Phase,
             ErrorMessage = session.ErrorMessage,
             Entities = session.Status == "ready" ? session.Entities : null,
-            OriginalFileName = session.Status == "ready" ? session.OriginalFileName : null
+            OriginalFileName = session.Status == "ready" ? session.OriginalFileName : null,
+            IsEmail = session.IsEmailSession,
+            AttachmentCount = Math.Max(0, session.EmailSources.Count - 1) // -1 for body
         });
     }
 
@@ -128,6 +132,7 @@ public class RedactionController : ControllerBase
         var docIntelligence = scope.ServiceProvider.GetRequiredService<IDocumentIntelligenceService>();
         var piiDetection    = scope.ServiceProvider.GetRequiredService<IPiiDetectionService>();
         var faceDetection   = scope.ServiceProvider.GetRequiredService<IFaceDetectionService>();
+        var emailParser     = scope.ServiceProvider.GetRequiredService<IEmailParserService>();
         var sessions        = scope.ServiceProvider.GetRequiredService<SessionStore>();
         var logger          = scope.ServiceProvider.GetRequiredService<ILogger<RedactionController>>();
 
@@ -136,7 +141,15 @@ public class RedactionController : ControllerBase
 
         try
         {
-            var isTxt = Path.GetExtension(filePath).Equals(".txt", StringComparison.OrdinalIgnoreCase);
+            var ext    = Path.GetExtension(filePath).ToLowerInvariant();
+            var isTxt  = ext == ".txt";
+            var isEmail = ext == ".eml" || ext == ".msg";
+
+            if (isEmail)
+            {
+                await ProcessEmailAsync(session, filePath, emailParser, docIntelligence, piiDetection, faceDetection, logger);
+                return;
+            }
 
             // DI and face detection are independent — start both at the same time.
             // DI processes full text (slow, 3–10 s). Face API only looks for face rectangles (fast, ~300 ms).
@@ -194,6 +207,98 @@ public class RedactionController : ControllerBase
             session.Phase        = string.Empty;
             session.ErrorMessage = ex.Message;
             logger.LogError(ex, "Background: processing failed for session {Id}", sessionId);
+        }
+    }
+
+    private static async Task ProcessEmailAsync(
+        SessionData session, string filePath,
+        IEmailParserService emailParser,
+        IDocumentIntelligenceService docIntelligence,
+        IPiiDetectionService piiDetection,
+        IFaceDetectionService faceDetection,
+        ILogger logger)
+    {
+        session.Phase = faceDetection.IsConfigured ? "extracting_with_faces" : "extracting";
+
+        var emailResult = emailParser.Parse(filePath);
+
+        // Build source list: body first, then attachments
+        var sources = new List<EmailSource>
+        {
+            new() { Label = "Email body", FilePath = emailResult.BodyTempFilePath, Extension = ".txt" }
+        };
+        foreach (var att in emailResult.Attachments)
+            sources.Add(new EmailSource { Label = att.OriginalName, FilePath = att.TempFilePath, Extension = att.Extension });
+
+        // Process all sources in parallel — each independently runs DI + face + PII
+        var tasks = sources.Select(s =>
+            ProcessEmailPartAsync(s.Label, s.FilePath, s.Extension, docIntelligence, piiDetection, faceDetection, logger));
+
+        var results = await Task.WhenAll(tasks);
+
+        session.Entities     = results.SelectMany(r => r.Entities).ToList();
+        session.Words        = results.SelectMany(r => r.Words).ToList();
+        session.EmailSources = sources;
+        session.Phase        = string.Empty;
+        session.Status       = "ready";
+
+        logger.LogInformation("Email processing complete: {EntityCount} entities from {SourceCount} source(s)",
+            session.Entities.Count, sources.Count);
+    }
+
+    private record EmailPartResult(List<PiiEntityResult> Entities, List<WordSearchResult> Words);
+
+    private static async Task<EmailPartResult> ProcessEmailPartAsync(
+        string sourceLabel, string filePath, string ext,
+        IDocumentIntelligenceService docIntelligence,
+        IPiiDetectionService piiDetection,
+        IFaceDetectionService faceDetection,
+        ILogger logger)
+    {
+        try
+        {
+            // Skip unsupported attachment formats (e.g. .zip, .exe embedded in email)
+            var isTxt = ext == ".txt";
+            if (!isTxt && !AllowedExtensions.Contains(ext))
+            {
+                logger.LogInformation("Skipping email attachment '{Label}' — unsupported format '{Ext}'", sourceLabel, ext);
+                return new EmailPartResult([], []);
+            }
+
+            // DI (or plain-text read) + face detection start in parallel
+            var faceRunning = faceDetection.IsConfigured && !isTxt;
+
+            var diTask = isTxt
+                ? Task.FromResult(ExtractFromPlainText(filePath))
+                : docIntelligence.AnalyzeDocumentAsync(filePath);
+
+            var faceTask = faceRunning
+                ? SafeDetectFacesAsync(filePath, faceDetection, logger)
+                : Task.FromResult<List<PiiEntityResult>>([]);
+
+            var extraction   = await diTask;
+            var entities     = await piiDetection.DetectPiiAsync(extraction.FullText, extraction.Words, extraction.Pages, extraction.DetectedLanguage);
+            var faceEntities = await faceTask;
+
+            // Tag all entities with the source so the frontend can group/display them
+            foreach (var e in entities)      e.Source = sourceLabel;
+            foreach (var e in faceEntities)  e.Source = sourceLabel;
+
+            var words = extraction.Words
+                .GroupBy(w => w.Content.ToLowerInvariant())
+                .Select(g => g.First())
+                .Select(w => new WordSearchResult { Text = w.Content, PageNumber = w.PageNumber, Polygon = w.BoundingPolygon, IsPixelUnit = w.IsPixelUnit })
+                .ToList();
+
+            logger.LogInformation("Email part '{Label}': {EntityCount} entities, {FaceCount} face(s)",
+                sourceLabel, entities.Count, faceEntities.Count);
+
+            return new EmailPartResult([..entities, ..faceEntities], words);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to process email part '{Label}' — skipping", sourceLabel);
+            return new EmailPartResult([], []);
         }
     }
 
@@ -343,6 +448,32 @@ public class RedactionController : ControllerBase
 
         // Resolve which file to use: Office formats convert to PDF on first call
         var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
+
+        // Email sessions: preview the body only; attachments are handled at redact time
+        if (session.IsEmailSession)
+        {
+            var bodySource   = session.EmailSources.First();
+            var selectedSet3 = new HashSet<string>(request.SelectedEntityIds);
+            // Include "Email body" entities AND manual entities (Source == "") — manual adds have no source tag
+            var bodyEntities = session.Entities.Where(e => selectedSet3.Contains(e.Id) && (e.Source == "Email body" || e.Source == "")).ToList();
+            string htmlPath;
+
+            if (bodyEntities.Count > 0)
+            {
+                htmlPath = CreateTxtHighlightHtml(bodySource.FilePath, bodyEntities);
+                session.CachedHighlightWorkingPath = htmlPath;
+                session.CachedHighlightEntityIds   = selectedSet3.ToList();
+            }
+            else
+            {
+                // No body entities selected — serve the plain body so user can see the email text
+                htmlPath = CreateTxtHighlightHtml(bodySource.FilePath, []);
+            }
+
+            var token      = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(htmlPath));
+            int attachCount = session.EmailSources.Count - 1;
+            return Ok(new { fileUrl = $"/api/redaction/file/{Uri.EscapeDataString(token)}", hasHighlights = bodyEntities.Count > 0, fileType = "html", isEmailSession = true, attachmentCount = attachCount });
+        }
 
         // Plain text: generate highlighted HTML directly — no Aspose PDF conversion needed
         if (ext == ".txt")
@@ -630,12 +761,20 @@ public class RedactionController : ControllerBase
     {
         var text = System.IO.File.ReadAllText(filePath);
 
-        // Use the precise char ranges recorded at PII detection time
-        var ranges = entities
-            .SelectMany(e => e.CharRanges)
-            .Select(r => (start: r.Offset, end: r.Offset + r.Length))
-            .Where(r => r.start >= 0 && r.end <= text.Length)
-            .ToList();
+        // Find all occurrences of each entity text by string search — same approach as
+        // PDF (TextFragmentAbsorber) and Excel. Avoids depending on Azure char offsets,
+        // which can drift when the text contains mixed line endings or Unicode sequences.
+        var ranges = new List<(int start, int end)>();
+        foreach (var entity in entities)
+        {
+            if (string.IsNullOrEmpty(entity.Text)) continue;
+            int pos = 0;
+            while ((pos = text.IndexOf(entity.Text, pos, StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                ranges.Add((pos, pos + entity.Text.Length));
+                pos += entity.Text.Length;
+            }
+        }
 
         ranges = [.. ranges.OrderBy(r => r.start)];
         var merged = new List<(int start, int end)>();
@@ -701,22 +840,61 @@ public class RedactionController : ControllerBase
         var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
         string redactedPath;
 
+        // Email: redact each source file individually, then zip all outputs
+        if (session.IsEmailSession)
+        {
+            var zipPath = Path.Combine(Path.GetTempPath(), $"redacted_{Guid.NewGuid():N}.zip");
+            using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+            {
+                foreach (var source in session.EmailSources)
+                {
+                    // Include source-specific entities AND manual entities (Source == "")
+                    var sourceSelected = selected.Where(e => e.Source == source.Label || e.Source == "").ToList();
+                    if (sourceSelected.Count == 0) continue;
+
+                    string redactedSourcePath;
+                    if (source.Extension == ".txt")
+                    {
+                        var text = System.IO.File.ReadAllText(source.FilePath);
+                        // Redact by text search (longest first to avoid partial overlaps),
+                        // consistent with PDF and Excel redaction.
+                        foreach (var entity in sourceSelected.OrderByDescending(e => e.Text.Length))
+                            text = ReplaceTextCaseInsensitive(text, entity.Text, new string('█', entity.Text.Length));
+                        redactedSourcePath = Path.Combine(Path.GetTempPath(), $"body_redacted_{Guid.NewGuid():N}.txt");
+                        System.IO.File.WriteAllText(redactedSourcePath, text);
+                    }
+                    else if (_officeConverter.IsExcelFormat(source.Extension))
+                    {
+                        var texts = sourceSelected.Select(e => e.Text).Distinct().ToList();
+                        redactedSourcePath = _officeConverter.RedactExcel(source.FilePath, texts);
+                    }
+                    else
+                    {
+                        var redactFilePath = _officeConverter.NeedsPdfConversion(source.Extension)
+                            ? _officeConverter.ConvertToPdf(source.FilePath)
+                            : source.FilePath;
+                        redactedSourcePath = await _redaction.ApplyPermanentRedactionAsync(redactFilePath, sourceSelected);
+                    }
+
+                    var entryName = source.Label == "Email body"
+                        ? "email_body_redacted.txt"
+                        : Path.GetFileNameWithoutExtension(source.Label) + "_redacted" + Path.GetExtension(source.Label);
+                    zip.CreateEntryFromFile(redactedSourcePath, entryName);
+                }
+            }
+
+            var baseName = Path.GetFileNameWithoutExtension(session.OriginalFileName);
+            return PhysicalFile(zipPath, "application/zip", baseName + "_redacted.zip");
+        }
+
         if (ext == ".txt")
         {
             var text = System.IO.File.ReadAllText(session.FilePath);
 
-            // Collect all precise char ranges from every selected entity, sort back-to-front
-            // so replacing a range doesn't shift the offsets of earlier ranges.
-            var allRanges = selected
-                .SelectMany(e => e.CharRanges)
-                .OrderByDescending(r => r.Offset)
-                .ToList();
-
-            foreach (var (offset, length) in allRanges)
-            {
-                if (offset < 0 || offset + length > text.Length) continue;
-                text = text[..offset] + new string('█', length) + text[(offset + length)..];
-            }
+            // Redact by text search (longest first to avoid partial overlaps),
+            // consistent with PDF (TextFragmentAbsorber) and Excel redaction.
+            foreach (var entity in selected.OrderByDescending(e => e.Text.Length))
+                text = ReplaceTextCaseInsensitive(text, entity.Text, new string('█', entity.Text.Length));
 
             redactedPath = Path.Combine(
                 Path.GetDirectoryName(session.FilePath)!,

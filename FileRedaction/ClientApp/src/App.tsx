@@ -89,7 +89,9 @@ export default function App() {
           const result: UploadResponse = {
             sessionId: processingSession.sessionId,
             originalFileName: processingSession.originalFileName,
-            entities: status.entities
+            entities: status.entities,
+            isEmail: status.isEmail,
+            attachmentCount: status.attachmentCount ?? 0
           }
           setUploadResult(result)
           setSelectedIds(new Set(status.entities.map(e => e.id)))
@@ -229,6 +231,8 @@ export default function App() {
             onDone={() => setStep('done')}
             previewCache={previewCache}
             onPreviewCached={setPreviewCache}
+            isEmail={uploadResult.isEmail}
+            attachmentCount={uploadResult.attachmentCount ?? 0}
           />
         )}
 

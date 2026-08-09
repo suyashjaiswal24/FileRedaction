@@ -12,11 +12,13 @@ interface Props {
   onDone: () => void
   previewCache: { key: string; data: PreviewResponse } | null
   onPreviewCached: (cache: { key: string; data: PreviewResponse }) => void
+  isEmail?: boolean
+  attachmentCount?: number
 }
 
 const ENTERPRISE_KEY = 'DP-ENT-DEMO-2026-FULL'
 
-export default function DocumentPreview({ sessionId, selectedEntityIds, selectedCount, fileName, onBack, onDone, previewCache, onPreviewCached }: Props) {
+export default function DocumentPreview({ sessionId, selectedEntityIds, selectedCount, fileName, onBack, onDone, previewCache, onPreviewCached, isEmail, attachmentCount }: Props) {
   const [status, setStatus] = useState<'loading' | 'ready' | 'redacting' | 'error'>('loading')
   const [preview, setPreview] = useState<PreviewResponse | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
@@ -48,8 +50,8 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      // Excel preview is HTML but the redacted download is the original format (xlsx/xls/ods)
-      const downloadExt = previewFileType === 'html' ? ext : previewFileType
+      // Email sessions download a zip; Excel preview is HTML but downloads the original format
+      const downloadExt = isEmail ? 'zip' : (previewFileType === 'html' ? ext : previewFileType)
       a.download = fileName.replace(/\.[^.]+$/, '') + '_redacted.' + downloadExt
       a.click()
       URL.revokeObjectURL(url)
@@ -108,6 +110,21 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
             <span>
               <strong>{preview.fileType.toUpperCase()}</strong> — yellow highlights are PDF-only.
               The selected text will still be permanently redacted when you confirm.
+            </span>
+          </div>
+        )}
+
+        {/* Email session banner */}
+        {isEmail && (
+          <div style={{ ...styles.infoBanner, background: '#f0fdf4', borderColor: '#bbf7d0', color: '#166534' }}>
+            <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg>
+            <span>
+              Previewing <strong>email body</strong>.
+              {(attachmentCount ?? 0) > 0
+                ? ` ${attachmentCount} attachment${attachmentCount === 1 ? '' : 's'} will also be redacted and included in the ZIP download.`
+                : ' No attachments detected.'}
             </span>
           </div>
         )}
@@ -188,7 +205,9 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
                 </div>
               ) : (
                 <button style={styles.redactBtn} onClick={handleRedact}>
-                  Confirm &amp; Redact Document
+                  {isEmail
+                    ? `Confirm & Redact (Download ZIP${(attachmentCount ?? 0) > 0 ? ` · ${(attachmentCount ?? 0) + 1} files` : ''})`
+                    : 'Confirm & Redact Document'}
                 </button>
               )
           )}
