@@ -144,7 +144,8 @@ public class PiiDetectionService : IPiiDetectionService
                             PageNumber = w.PageNumber,
                             Polygon = w.BoundingPolygon,
                             IsPixelUnit = w.IsPixelUnit
-                        }).ToList()
+                        }).ToList(),
+                        CharRanges = [(absoluteOffset, entity.Length)]
                     });
                 }
             }
@@ -161,6 +162,7 @@ public class PiiDetectionService : IPiiDetectionService
             {
                 var best = g.OrderByDescending(e => e.ConfidenceScore).First();
                 best.BoundingRegions = g.SelectMany(e => e.BoundingRegions).ToList();
+                best.CharRanges = g.SelectMany(e => e.CharRanges).OrderBy(r => r.Offset).ToList();
                 best.OccurrenceCount = g.Count();
                 return best;
             })

@@ -15,7 +15,7 @@ public interface IOfficeConversionService
 public class OfficeConversionService : IOfficeConversionService
 {
     private static readonly HashSet<string> WordExts =
-        [".docx", ".doc", ".docm", ".odt", ".rtf"];
+        [".docx", ".doc", ".docm", ".odt", ".rtf", ".txt"];
     private static readonly HashSet<string> CellsExts =
         [".xlsx", ".xls", ".ods"];
     private static readonly HashSet<string> SlidesExts =

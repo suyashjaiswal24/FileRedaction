@@ -135,20 +135,17 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
           )}
 
           {status === 'ready' && preview && previewFileType === 'html' && (
-            <div style={styles.centered}>
-              <div style={{ fontSize: 40, marginBottom: 16 }}>📊</div>
-              <p style={{ fontWeight: 600, fontSize: 16, marginBottom: 8 }}>Excel Preview with Highlights</p>
-              <p style={{ color: '#555', fontSize: 14, marginBottom: 24, maxWidth: 380, textAlign: 'center' }}>
-                Yellow-highlighted cells are shown in the browser-rendered preview. Click below to open it.
-              </p>
-              <a
-                href={preview.fileUrl}
-                target="_blank"
-                rel="noreferrer"
-                style={styles.openTabBtn}
-              >
-                Open highlighted preview ↗
-              </a>
+            <div style={{ width: '100%' }}>
+              <div style={styles.previewToolbar}>
+                <a href={preview.fileUrl} target="_blank" rel="noreferrer" style={styles.openTabLink}>
+                  Open in new tab ↗
+                </a>
+              </div>
+              <iframe
+                src={preview.fileUrl}
+                style={{ display: 'block', width: '100%', height: 600, border: 'none' }}
+                title="Document preview"
+              />
             </div>
           )}
 
@@ -214,7 +211,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   previewArea: {
     border: '1px solid #e5e7eb', borderRadius: 10,
-    minHeight: 480, overflow: 'hidden', background: '#f8f9fa',
+    minHeight: 480, overflow: 'visible', background: '#f8f9fa',
     display: 'flex', flexDirection: 'column'
   },
   centered: { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 40 },

@@ -12,6 +12,7 @@ public class RedactionController : ControllerBase
     private static readonly string[] AllowedExtensions =
     {
         ".pdf",
+        ".txt",
         ".docx", ".doc", ".docm", ".odt", ".rtf",
         ".xlsx", ".xls", ".ods",
         ".pptx", ".ppt", ".odp",
@@ -133,11 +134,15 @@ public class RedactionController : ControllerBase
 
         try
         {
-            // DI extraction runs on the ORIGINAL file — Azure DI natively supports XLSX/DOCX/PPTX,
-            // so a 76KB Excel stays 76KB here instead of becoming a 6MB Aspose-converted PDF.
+            // .txt: skip DI entirely — the file is already plain text, no OCR needed.
+            // DI extraction runs on the ORIGINAL file for everything else — Azure DI natively
+            // supports XLSX/DOCX/PPTX, so a 76KB Excel stays 76KB here instead of becoming a
+            // 6MB Aspose-converted PDF.
             session.Phase = "extracting";
             logger.LogInformation("Background: starting DI extraction for session {Id}", sessionId);
-            var extraction = await docIntelligence.AnalyzeDocumentAsync(filePath);
+            var extraction = Path.GetExtension(filePath).Equals(".txt", StringComparison.OrdinalIgnoreCase)
+                ? ExtractFromPlainText(filePath)
+                : await docIntelligence.AnalyzeDocumentAsync(filePath);
 
             session.Phase = "detecting";
             logger.LogInformation("Background: starting PII detection for session {Id}", sessionId);
@@ -200,6 +205,19 @@ public class RedactionController : ControllerBase
 
         // Resolve which file to use: Office formats convert to PDF on first call
         var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
+
+        // Plain text: generate highlighted HTML directly — no Aspose PDF conversion needed
+        if (ext == ".txt")
+        {
+            var selectedSet2 = new HashSet<string>(request.SelectedEntityIds);
+            var selectedEntities2 = session.Entities.Where(e => selectedSet2.Contains(e.Id)).ToList();
+            var htmlPath = CreateTxtHighlightHtml(session.FilePath, selectedEntities2);
+            session.CachedHighlightWorkingPath = htmlPath;
+            session.CachedHighlightEntityIds = selectedSet2.ToList();
+            var htmlToken = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(htmlPath));
+            return Ok(new { fileUrl = $"/api/redaction/file/{Uri.EscapeDataString(htmlToken)}", hasHighlights = true, fileType = "html" });
+        }
+
         string workingFilePath;
         string workingExt;
         if (_officeConverter.NeedsPdfConversion(ext))
@@ -427,6 +445,107 @@ public class RedactionController : ControllerBase
         return Ok(entity);
     }
 
+    /// <summary>
+    /// Bypasses Azure DI for plain-text files: reads the file directly and builds synthetic
+    /// WordInfo objects so the rest of the PII pipeline works unchanged.
+    /// </summary>
+    private static DocumentExtractionResult ExtractFromPlainText(string filePath)
+    {
+        var text = System.IO.File.ReadAllText(filePath);
+        var words = new List<WordInfo>();
+
+        int i = 0;
+        while (i < text.Length)
+        {
+            // Skip whitespace
+            while (i < text.Length && char.IsWhiteSpace(text[i])) i++;
+            if (i >= text.Length) break;
+
+            int start = i;
+            while (i < text.Length && !char.IsWhiteSpace(text[i])) i++;
+
+            words.Add(new WordInfo
+            {
+                Content = text[start..i],
+                Offset = start,
+                Length = i - start,
+                PageNumber = 1,
+                BoundingPolygon = Array.Empty<double>(),
+                IsPixelUnit = false
+            });
+        }
+
+        return new DocumentExtractionResult
+        {
+            FullText = text,
+            Words = words,
+            Pages = [new PageInfo { PageNumber = 1, TextOffset = 0, TextLength = text.Length }],
+            DetectedLanguage = "en"
+        };
+    }
+
+    /// <summary>
+    /// Builds a self-contained HTML file that renders plain text with selected entities
+    /// highlighted in yellow — no Aspose or PDF conversion required.
+    /// </summary>
+    private static string CreateTxtHighlightHtml(string filePath, List<PiiEntityResult> entities)
+    {
+        var text = System.IO.File.ReadAllText(filePath);
+
+        // Use the precise char ranges recorded at PII detection time
+        var ranges = entities
+            .SelectMany(e => e.CharRanges)
+            .Select(r => (start: r.Offset, end: r.Offset + r.Length))
+            .Where(r => r.start >= 0 && r.end <= text.Length)
+            .ToList();
+
+        ranges = [.. ranges.OrderBy(r => r.start)];
+        var merged = new List<(int start, int end)>();
+        foreach (var r in ranges)
+        {
+            if (merged.Count > 0 && r.start <= merged[^1].end)
+                merged[^1] = (merged[^1].start, Math.Max(merged[^1].end, r.end));
+            else
+                merged.Add(r);
+        }
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append("<!DOCTYPE html><html><head><meta charset='utf-8'><style>")
+          .Append("body{font-family:monospace;white-space:pre-wrap;padding:20px 28px;font-size:13px;line-height:1.6;}")
+          .Append("mark{background:#ffd700;border-radius:2px;padding:0 1px;}")
+          .Append("</style></head><body>");
+
+        int cursor = 0;
+        foreach (var (start, end) in merged)
+        {
+            sb.Append(HtmlEncode(text[cursor..start]));
+            sb.Append("<mark>").Append(HtmlEncode(text[start..end])).Append("</mark>");
+            cursor = end;
+        }
+        sb.Append(HtmlEncode(text[cursor..])).Append("</body></html>");
+
+        var outPath = Path.Combine(Path.GetTempPath(), $"txt_preview_{Guid.NewGuid():N}.html");
+        System.IO.File.WriteAllText(outPath, sb.ToString());
+        return outPath;
+    }
+
+    private static string ReplaceTextCaseInsensitive(string text, string find, string replacement)
+    {
+        var sb = new System.Text.StringBuilder();
+        int searchFrom = 0;
+        while (true)
+        {
+            int pos = text.IndexOf(find, searchFrom, StringComparison.OrdinalIgnoreCase);
+            if (pos < 0) { sb.Append(text[searchFrom..]); break; }
+            sb.Append(text[searchFrom..pos]).Append(replacement);
+            searchFrom = pos + find.Length;
+        }
+        return sb.ToString();
+    }
+
+    private static string HtmlEncode(string s) =>
+        s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+
     /// <summary>Permanently redacts selected entities and streams the redacted PDF for download.</summary>
     [HttpPost("redact")]
     public async Task<IActionResult> Redact([FromBody] RedactRequest request)
@@ -443,6 +562,31 @@ public class RedactionController : ControllerBase
 
         var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
         string redactedPath;
+
+        if (ext == ".txt")
+        {
+            var text = System.IO.File.ReadAllText(session.FilePath);
+
+            // Collect all precise char ranges from every selected entity, sort back-to-front
+            // so replacing a range doesn't shift the offsets of earlier ranges.
+            var allRanges = selected
+                .SelectMany(e => e.CharRanges)
+                .OrderByDescending(r => r.Offset)
+                .ToList();
+
+            foreach (var (offset, length) in allRanges)
+            {
+                if (offset < 0 || offset + length > text.Length) continue;
+                text = text[..offset] + new string('█', length) + text[(offset + length)..];
+            }
+
+            redactedPath = Path.Combine(
+                Path.GetDirectoryName(session.FilePath)!,
+                Path.GetFileNameWithoutExtension(session.FilePath) + "_redacted.txt");
+            System.IO.File.WriteAllText(redactedPath, text);
+            return PhysicalFile(redactedPath, "text/plain",
+                Path.GetFileNameWithoutExtension(session.OriginalFileName) + "_redacted.txt");
+        }
 
         if (_officeConverter.IsExcelFormat(ext))
         {

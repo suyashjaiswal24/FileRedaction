@@ -35,6 +35,12 @@ public class PiiEntityResult
     public double ConfidenceScore { get; set; }
     public int OccurrenceCount { get; set; } = 1;
     public List<BoundingRegion> BoundingRegions { get; set; } = new();
+    /// <summary>
+    /// Absolute character ranges in the source text for every occurrence.
+    /// Populated for text-based files (TXT) so redaction can use exact offsets
+    /// instead of fallible text search.
+    /// </summary>
+    public List<(int Offset, int Length)> CharRanges { get; set; } = new();
 }
 
 public class BoundingRegion
