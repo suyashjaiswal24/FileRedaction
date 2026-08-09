@@ -2,6 +2,8 @@ using FileRedaction.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 500L * 1024 * 1024);
+
 builder.Services.AddControllers();
 
 builder.Services.AddSingleton<SessionStore>();
@@ -13,6 +15,14 @@ builder.Services.AddSingleton<IOfficeConversionService, OfficeConversionService>
 builder.Services.AddSingleton<AudioSessionStore>();
 builder.Services.AddScoped<IAudioTranscriptionService, AudioTranscriptionService>();
 builder.Services.AddScoped<IAudioRedactionService, AudioRedactionService>();
+
+builder.Services.AddSingleton<VideoSessionStore>();
+// SecureRedactService is singleton so the token cache is shared across all requests
+builder.Services.AddSingleton<ISecureRedactService, SecureRedactService>();
+builder.Services.AddHttpClient(nameof(SecureRedactService), client =>
+{
+    client.Timeout = TimeSpan.FromMinutes(10); // video uploads can be large
+});
 
 // Named HttpClient for the Azure AI Language Service (PII detection)
 builder.Services.AddHttpClient(nameof(PiiDetectionService), (sp, client) =>

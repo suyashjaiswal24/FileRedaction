@@ -3,11 +3,12 @@ import FileUpload from './components/FileUpload'
 import EntitySelector from './components/EntitySelector'
 import DocumentPreview from './components/DocumentPreview'
 import AudioRedaction from './components/AudioRedaction'
+import VideoRedaction from './components/VideoRedaction'
 import { getUploadStatus } from './api'
 import type { UploadResponse, UploadAcceptedResponse, PreviewResponse } from './types'
 
 type Step = 'upload' | 'processing' | 'select' | 'preview' | 'done'
-type Mode = 'document' | 'audio'
+type Mode = 'document' | 'audio' | 'video'
 
 const STEPS = ['Upload', 'Select PII', 'Preview', 'Redact']
 
@@ -44,7 +45,7 @@ export default function App() {
   function switchMode(m: Mode) {
     setMode(m)
     // Reset document state when switching away
-    if (m === 'audio') {
+    if (m === 'audio' || m === 'video') {
       setStep('upload')
       setUploadResult(null)
       setSelectedIds(new Set())
@@ -125,6 +126,15 @@ export default function App() {
             >
               Audio
             </button>
+            <button
+              onClick={() => switchMode('video')}
+              style={{
+                ...styles.modeTab,
+                ...(mode === 'video' ? styles.modeTabActive : {})
+              }}
+            >
+              Video
+            </button>
           </div>
         </div>
 
@@ -156,6 +166,10 @@ export default function App() {
       <main style={styles.main}>
         {mode === 'audio' && (
           <AudioRedaction onBack={() => switchMode('document')} />
+        )}
+
+        {mode === 'video' && (
+          <VideoRedaction onBack={() => switchMode('document')} />
         )}
 
         {mode === 'document' && step === 'upload' && (
