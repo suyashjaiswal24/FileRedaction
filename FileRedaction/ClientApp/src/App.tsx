@@ -14,16 +14,22 @@ const STEPS = ['Upload', 'Select PII', 'Preview', 'Redact']
 
 const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'tiff', 'tif', 'bmp', 'gif', 'webp'])
 
-function phaseLabel(phase: string, fileName: string): string {
+function phaseLabels(phase: string, fileName: string): string[] {
   const ext = fileName.split('.').pop()?.toLowerCase() ?? ''
   if (phase === 'extracting') {
-    if (IMAGE_EXTS.has(ext)) return 'Analyzing image with Azure Document Intelligence…'
-    if (ext === 'txt')        return 'Reading plain text file…'
-    return 'Extracting text with Azure Document Intelligence…'
+    if (IMAGE_EXTS.has(ext)) return ['Analyzing image with Azure Document Intelligence…']
+    if (ext === 'txt')        return ['Reading plain text file…']
+    return ['Extracting text with Azure Document Intelligence…']
   }
-  if (phase === 'detecting') return 'Detecting PII entities…'
-  if (phase === 'detecting_faces') return 'Detecting faces with Azure Face API…'
-  return 'Finalising…'
+  if (phase === 'extracting_with_faces') {
+    const diLabel = IMAGE_EXTS.has(ext)
+      ? 'Analyzing image with Azure Document Intelligence…'
+      : 'Extracting text with Azure Document Intelligence…'
+    return [diLabel, 'Detecting faces with Azure Face API…']
+  }
+  if (phase === 'detecting') return ['Detecting PII entities…']
+  if (phase === 'detecting_faces') return ['Detecting faces with Azure Face API…']
+  return ['Finalising…']
 }
 
 export default function App() {
@@ -193,9 +199,9 @@ export default function App() {
                   ? 'Analysing image…'
                   : 'Analysing document…'}
               </h2>
-              <p style={{ color: '#555', fontSize: 14 }}>
-                {phaseLabel(processingPhase, processingSession.originalFileName)}
-              </p>
+              {phaseLabels(processingPhase, processingSession.originalFileName).map((label, i) => (
+                <p key={i} style={{ color: '#555', fontSize: 14, margin: '4px 0' }}>{label}</p>
+              ))}
               <p style={{ color: '#aaa', fontSize: 12, marginTop: 8 }}>{processingSession.originalFileName}</p>
             </div>
           </div>

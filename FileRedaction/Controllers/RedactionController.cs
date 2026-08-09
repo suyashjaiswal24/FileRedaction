@@ -136,19 +136,21 @@ public class RedactionController : ControllerBase
 
         try
         {
-            session.Phase = "extracting";
-            logger.LogInformation("Background: starting DI extraction + face detection in parallel for session {Id}", sessionId);
-
             var isTxt = Path.GetExtension(filePath).Equals(".txt", StringComparison.OrdinalIgnoreCase);
 
             // DI and face detection are independent — start both at the same time.
             // DI processes full text (slow, 3–10 s). Face API only looks for face rectangles (fast, ~300 ms).
             // By the time DI + PII finish, face results are almost certainly already waiting.
+            var faceRunning = faceDetection.IsConfigured && !isTxt;
+            session.Phase = faceRunning ? "extracting_with_faces" : "extracting";
+            logger.LogInformation("Background: starting DI extraction{FaceNote} for session {Id}",
+                faceRunning ? " + face detection in parallel" : "", sessionId);
+
             var diTask = isTxt
                 ? Task.FromResult(ExtractFromPlainText(filePath))
                 : docIntelligence.AnalyzeDocumentAsync(filePath);
 
-            var faceTask = faceDetection.IsConfigured
+            var faceTask = faceRunning
                 ? SafeDetectFacesAsync(filePath, faceDetection, logger)
                 : Task.FromResult<List<PiiEntityResult>>([]);
 
