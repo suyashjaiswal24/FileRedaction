@@ -70,7 +70,8 @@ public class RedactionService : IRedactionService
             {
                 var outPath = Path.Combine(Path.GetTempPath(), $"preview_{Guid.NewGuid():N}.png");
                 using var ms = new MemoryStream(File.ReadAllBytes(existingHighlightedPath));
-                using var bmp = new AD.Bitmap(ms);
+                using var raw0 = new AD.Bitmap(ms);
+                using var bmp = ToArgb32(raw0);
                 using var g = AD.Graphics.FromImage(bmp);
 
                 var dpiX = bmp.HorizontalResolution;
@@ -173,7 +174,8 @@ public class RedactionService : IRedactionService
 
             // Load via MemoryStream so the original file is not locked during processing
             using var ms = new MemoryStream(File.ReadAllBytes(filePath));
-            using var bmp = new AD.Bitmap(ms);
+            using var raw1 = new AD.Bitmap(ms);
+            using var bmp = ToArgb32(raw1);
             using var g = AD.Graphics.FromImage(bmp);
 
             var dpiX = bmp.HorizontalResolution;
@@ -209,7 +211,8 @@ public class RedactionService : IRedactionService
             _logger.LogInformation("Applying permanent image redaction → {Path}", outPath);
 
             using var ms = new MemoryStream(File.ReadAllBytes(filePath));
-            using var bmp = new AD.Bitmap(ms);
+            using var raw2 = new AD.Bitmap(ms);
+            using var bmp = ToArgb32(raw2);
             using var g = AD.Graphics.FromImage(bmp);
 
             var dpiX = bmp.HorizontalResolution;
@@ -234,6 +237,26 @@ public class RedactionService : IRedactionService
             bmp.Save(outStream, format);
             return outPath;
         });
+    }
+
+    /// <summary>
+    /// Indexed-pixel-format bitmaps (1bpp/4bpp/8bpp — common for barcodes and scanned BW images)
+    /// cannot be the target of a Graphics context. Convert to 32bpp ARGB first.
+    /// DrawImage FROM an indexed source onto a 32bpp target is fine.
+    /// </summary>
+    private static AD.Bitmap ToArgb32(AD.Bitmap src)
+    {
+        if ((src.PixelFormat & AD.Imaging.PixelFormat.Indexed) == 0)
+        {
+            // Already a direct-color format — return a clone so the caller always owns a fresh bitmap
+            return src.Clone(new System.Drawing.Rectangle(0, 0, src.Width, src.Height),
+                AD.Imaging.PixelFormat.Format32bppArgb);
+        }
+        var dst = new AD.Bitmap(src.Width, src.Height, AD.Imaging.PixelFormat.Format32bppArgb);
+        dst.SetResolution(src.HorizontalResolution, src.VerticalResolution);
+        using var g = AD.Graphics.FromImage(dst);
+        g.DrawImage(src, 0, 0);
+        return dst;
     }
 
     private static AsposeDrawing::System.Drawing.Imaging.ImageFormat GetImageFormatForExt(string ext) => ext switch

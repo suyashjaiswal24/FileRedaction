@@ -71,11 +71,15 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
             Path.GetFileName(filePath), fileSize);
 
         Stream stream;
+        int origPixelWidth = 0, origPixelHeight = 0;
+        bool wasCompressed = false;
+
         if (ImageExts.Contains(ext) && fileSize > MaxImageBytes)
         {
             _logger.LogInformation("Image exceeds {Max:N0} bytes — compressing before DI submission", MaxImageBytes);
-            stream = CompressImage(filePath);
-            _logger.LogInformation("Compressed to {Size:N0} bytes", stream.Length);
+            (stream, origPixelWidth, origPixelHeight) = CompressImage(filePath);
+            wasCompressed = true;
+            _logger.LogInformation("Compressed to {Size:N0} bytes (original {W}×{H}px)", stream.Length, origPixelWidth, origPixelHeight);
         }
         else
         {
@@ -104,9 +108,31 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
                 });
             }
 
+            // When the image was compressed before submission DI returns pixel coordinates
+            // relative to the COMPRESSED dimensions. Scale them back to the original image
+            // so that RedactionService draws on the right pixels.
+            float scaleX = 1f, scaleY = 1f;
+            if (wasCompressed && page.Unit == DocumentPageLengthUnit.Pixel && page.Width > 0 && page.Height > 0)
+            {
+                scaleX = (float)origPixelWidth  / (float)page.Width;
+                scaleY = (float)origPixelHeight / (float)page.Height;
+                _logger.LogInformation(
+                    "  Page {N}: DI dims={W}×{H}px  original={OW}×{OH}px  scale={SX:F4},{SY:F4}",
+                    page.PageNumber, page.Width, page.Height, origPixelWidth, origPixelHeight, scaleX, scaleY);
+            }
+
             bool isPixel = page.Unit == DocumentPageLengthUnit.Pixel;
             foreach (var word in page.Words)
             {
+                var rawPolygon = word.BoundingPolygon
+                    .SelectMany(p => new[] { (double)p.X, (double)p.Y })
+                    .ToArray();
+
+                // Apply scale if needed (no-op when scaleX/Y == 1)
+                if (scaleX != 1f || scaleY != 1f)
+                    for (int i = 0; i < rawPolygon.Length; i++)
+                        rawPolygon[i] *= (i % 2 == 0) ? scaleX : scaleY;
+
                 words.Add(new WordInfo
                 {
                     Content = word.Content,
@@ -114,9 +140,7 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
                     Length = word.Span.Length,
                     PageNumber = page.PageNumber,
                     IsPixelUnit = isPixel,
-                    BoundingPolygon = word.BoundingPolygon
-                        .SelectMany(p => new[] { (double)p.X, (double)p.Y })
-                        .ToArray()
+                    BoundingPolygon = rawPolygon
                 });
             }
         }
@@ -164,15 +188,17 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
         } // end await using stream
     }
 
-    private static MemoryStream CompressImage(string filePath)
+    private static (MemoryStream Stream, int OrigWidth, int OrigHeight) CompressImage(string filePath)
     {
         using var src = new AD.Bitmap(new MemoryStream(File.ReadAllBytes(filePath)));
+        int origWidth  = src.Width;
+        int origHeight = src.Height;
 
-        // Scale down proportionally so the compressed JPEG fits under MaxDiBytes
+        // Scale down proportionally so the compressed JPEG fits under MaxImageBytes
         var fileSize = new FileInfo(filePath).Length;
         float scale = Math.Min(1f, (float)Math.Sqrt((double)MaxImageBytes / fileSize) * 0.9f);
-        int w = Math.Max(1, (int)(src.Width * scale));
-        int h = Math.Max(1, (int)(src.Height * scale));
+        int w = Math.Max(1, (int)(origWidth  * scale));
+        int h = Math.Max(1, (int)(origHeight * scale));
 
         using var resized = new AD.Bitmap(w, h);
         using (var g = AD.Graphics.FromImage(resized))
@@ -187,6 +213,6 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
             AsposeDrawing::System.Drawing.Imaging.Encoder.Quality, 75L);
         resized.Save(ms, jpegEncoder, encoderParams);
         ms.Position = 0;
-        return ms;
+        return (ms, origWidth, origHeight);
     }
 }
