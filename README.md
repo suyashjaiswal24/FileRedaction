@@ -12,7 +12,7 @@ Upload a file → the app reads it, finds sensitive info like names, phone numbe
 
 | Mode | Supported Formats | What Gets Redacted |
 |------|------------------|-------------------|
-| **Document** | PDF, TXT, Word (.docx/.doc), Excel (.xlsx/.xls), PowerPoint (.pptx), Images (PNG, JPG, TIFF, BMP, GIF, WebP) | Text blacked out or replaced with `█`, faces blurred/boxed |
+| **Document** | PDF, TXT, Word (.docx/.doc), Excel (.xlsx/.xls), PowerPoint (.pptx), Images (PNG, JPG, TIFF, BMP, GIF, WebP), Email (.eml, .msg) | Text blacked out or replaced with `█`, faces blurred/boxed |
 | **Audio** | WAV, MP3, M4A, AAC, OGG, FLAC, WMA | PII speech segments replaced with a 1 kHz beep tone |
 | **Video** | MP4, MOV, AVI, MKV, WebM, WMV | Faces, licence plates, on-screen text, spoken audio — all via SecureRedact |
 
@@ -23,11 +23,13 @@ Upload a file → the app reads it, finds sensitive info like names, phone numbe
 ### Document Mode
 
 #### Step 1 — Upload
-- User drops or selects a file (max 20 MB).
+- User drops or selects a file (max 20 MB). Supported: PDF, TXT, Word, Excel, PowerPoint, images, and email files (`.eml`, `.msg`).
 - Server immediately saves it to a temp folder and returns a `sessionId`.
 - Background processing starts right away (the UI does not wait).
 
 #### Step 2 — Background Processing (the heavy lifting)
+
+**Email files (`.eml`, `.msg`) are handled differently — see the Email Processing section below.**
 
 Two things run **in parallel** from the moment the file is uploaded, while the browser polls every 2 seconds:
 
@@ -64,7 +66,8 @@ Once DI finishes, the extracted text is sent to **Azure AI Language Service** fo
 - Click "Preview Redaction" to see a highlighted version before committing.
 - **PDFs / Images:** A copy of the file is generated with yellow highlights over every selected entity. Faces get a yellow outlined box.
 - **Excel:** A copy of the spreadsheet is generated with yellow cell highlights, then exported to HTML and shown inline in the browser.
-- **TXT:** A self-contained HTML page is generated with `<mark>` highlights at exact character positions, shown inline in the browser.
+- **TXT / Email body:** A self-contained HTML page is generated with `<mark>` highlights. Highlighting uses **text search** (`IndexOf`) — not character offsets — so it always lands on the correct word regardless of line endings or encoding.
+- **Email sessions:** Only the email body is shown in the preview. Attachments are processed and included in the ZIP at redaction time.
 - **Incremental preview:** If you deselect/reselect entities after previewing, only the newly added highlights are drawn on the existing preview (faster than regenerating from scratch).
 
 #### Step 5 — Redact & Download
@@ -74,11 +77,39 @@ Once DI finishes, the extracted text is sent to **Azure AI Language Service** fo
 |-----------|-------------|
 | **PDF** | `RedactionAnnotation` (black filled rectangles) are applied over each entity's bounding box. For manually added words, `TextFragmentAbsorber` finds all occurrences in the PDF text layer. For faces, black boxes are placed using the PDF point coordinates. |
 | **Image** (PNG, JPG, etc.) | Black rectangles are drawn directly onto the image pixels at the bounding box positions returned by Document Intelligence. |
-| **TXT** | Each entity's precise character range is replaced with `█` characters, back-to-front order to avoid position shifting. Downloaded as a `.txt` file. |
+| **TXT** | Each entity's text is found by case-insensitive text search (longest entity first to avoid partial overlaps) and replaced with `█` characters. Downloaded as `.txt`. |
 | **Excel** | Cell values containing PII text are replaced with `█████` in the spreadsheet. Downloaded as `.xlsx`. |
 | **Word / PowerPoint** | Converted to PDF first (Aspose), then redacted the same as PDF. |
+| **Email (.eml/.msg)** | Each source (body + each attachment) is redacted independently using its own format's pipeline, then all redacted files are packaged into a single `.zip` for download. |
 
 - The redacted file is automatically downloaded by the browser.
+
+---
+
+### Email Processing (.eml and .msg)
+
+Email files are a special case because one file contains multiple processable parts: the email body plus zero or more attachments.
+
+#### Parsing
+- **`.eml`** (standard email format): parsed by **MimeKit**. Headers (From, To, CC, Subject) are prepended to the body text. If the email has a `text/plain` part, it's used as-is. If only `text/html` exists, tags are stripped to extract readable text.
+- **`.msg`** (Outlook format): parsed by **MSGReader**. Same header extraction; RTF body is converted to plain text by MSGReader.
+
+#### Text normalisation
+Email bodies often contain `\r\n` line endings (CRLF is the email standard), tab-indented HTML, and many blank lines. Before saving:
+1. `\r\n` → `\n` and `\r` → `\n` (normalise all line endings)
+2. Any run of 2+ consecutive newlines is collapsed to a single newline (no blank lines in the output)
+
+For HTML bodies: each line is also trimmed of leading/trailing whitespace and empty lines are dropped, which removes the heavy indentation that HTML email templates produce after tag stripping.
+
+#### Parallel processing
+All sources (email body + attachments) are processed **simultaneously** via `Task.WhenAll`. Each source independently runs the full DI + Face + PII pipeline, exactly like a standalone file upload. Unsupported attachment formats (e.g. `.zip`, `.exe`) are silently skipped.
+
+#### Entity tagging
+Every entity is tagged with a `Source` label ("Email body" or the attachment filename). This is shown as a badge in the entity list so you can see which PII came from where. Manually added entities have no source tag and are applied everywhere.
+
+#### Output
+- **Preview:** Shows only the email body (highlighted HTML). A banner shows how many attachments will also be redacted.
+- **Redact:** Each source is redacted with its own format's pipeline, then all outputs are bundled into a `.zip` file named `<originalFile>_redacted.zip`.
 
 ---
 
@@ -140,6 +171,8 @@ Authentication is OAuth2 client credentials — the token is cached and reused u
 | **Aspose.Cells** | Excel highlight preview, Excel redaction, Excel → HTML export for inline preview |
 | **Aspose.Slides** | PowerPoint → PDF conversion |
 | **Aspose.Drawing** | Image compression (resize large images before sending to Azure DI), bitmap manipulation (indexed pixel format handling for barcodes) |
+| **MimeKit** (4.8.0) | Parse `.eml` files — extract headers, text/plain body, HTML body, and attachments |
+| **MSGReader** (3.6.0) | Parse `.msg` Outlook files — extract headers, RTF→text body, and attachments. Read-only, MIT licensed, no Aspose.Email dependency. |
 | **NAudio** | Decode any audio format to PCM WAV, write redacted WAV with beep tones |
 | **React + TypeScript** | Frontend UI (Vite build tool) |
 | **Axios** | HTTP calls from frontend to backend API |
@@ -217,8 +250,8 @@ All endpoints are under `/api/redaction/` (documents), `/api/audio/` (audio), an
 | Phase value | Shown in UI as |
 |-------------|---------------|
 | `extracting` | "Extracting text with Azure Document Intelligence…" (or "Analyzing image…" for images, "Reading plain text file…" for TXT) |
+| `extracting_with_faces` | Two lines simultaneously: "Extracting text with Azure Document Intelligence…" + "Detecting faces with Azure Face API…" — shown when both run in parallel |
 | `detecting` | "Detecting PII entities…" |
-| `detecting_faces` | "Detecting faces with Azure Face API…" |
 | *(empty / ready)* | Processing complete |
 
 ---
@@ -234,11 +267,14 @@ FileRedaction/
 │
 ├── Services/
 │   ├── DocumentIntelligenceService.cs # Azure DI wrapper. Handles image compression + coord scaling.
-│   ├── PiiDetectionService.cs         # Azure Language Service wrapper. Tracks char offsets + deduplication.
+│   ├── PiiDetectionService.cs         # Azure Language Service wrapper. Chunks by page, deduplicates entities.
 │   ├── RedactionService.cs            # PDF/image highlight preview + permanent black-box redaction (Aspose.PDF).
 │   │                                  # Also handles indexed pixel format images (barcodes) via ToArgb32 helper.
 │   ├── OfficeConversionService.cs     # Office→PDF conversion, Excel highlight/redact, Excel→HTML export.
 │   ├── FaceDetectionService.cs        # Azure Face API wrapper. Returns pixel bounding boxes per face.
+│   ├── EmailParserService.cs          # Parses .eml (MimeKit) and .msg (MSGReader). Extracts body as .txt temp
+│   │                                  # file and each attachment as its own temp file. Normalises line endings
+│   │                                  # and strips HTML indentation so the body text is clean for PII detection.
 │   ├── AudioTranscriptionService.cs   # Azure Speech SDK: decodes audio → transcribes → returns word timestamps.
 │   ├── AudioRedactionService.cs       # Reads PCM WAV, replaces time ranges with 1 kHz beep, writes new WAV.
 │   ├── SecureRedactService.cs         # SecureRedact v3 API client: auth + upload + status + redact + publish.
@@ -287,8 +323,8 @@ The Face API returns pixel positions. PDFs use a point coordinate system (72 poi
 - `y_bottom_points = page_height_points − (pixel_top + pixel_height) × (72 / 150)`
 - `y_top_points = page_height_points − pixel_top × (72 / 150)`
 
-### Why TXT redaction uses character offsets
-When you replace text at position X, everything after it shifts. If you naively replace from front to back, all subsequent offsets are wrong. The app collects all character ranges for selected entities, sorts them **back-to-front** (largest offset first), and replaces from the end of the string forward so earlier offsets are never disturbed.
+### Why TXT and email body redaction use text search (not character offsets)
+Azure Language Service returns character offsets, but those offsets are relative to the exact UTF-16 string it received. Line ending differences (`\r\n` vs `\n`), BOM handling, and encoding edge cases can all cause progressive drift between Azure's offset and the .NET string index, making highlights land on the wrong characters. Rather than trying to perfectly reconcile all these edge cases, TXT highlighting and redaction use **case-insensitive text search** (`IndexOf` / `ReplaceTextCaseInsensitive`), the same approach as PDF (`TextFragmentAbsorber`) and Excel (cell value matching). Longer entities are searched first to avoid partial-word replacements (e.g. "Swiggy instamart" before "Swiggy").
 
 ### Why Excel preview is shown as HTML (not PDF)
 Aspose.Cells exports Excel to a multi-file HTML bundle (a `preview.html` with companion CSS and per-sheet `.htm` files). This HTML uses JavaScript for tab switching, so it must be served in a plain `<iframe>` — no `sandbox` attribute, because sandbox blocks inline scripts.
@@ -308,7 +344,10 @@ The 1 kHz tone is a pure sine wave: `sample = sin(2π × 1000 × t)` at amplitud
 - **Face detection image cap:** 6 MB (Azure Face API hardware limit — images larger than this are skipped with a warning).
 - **TXT, Excel, Word, PowerPoint face detection:** Not supported — face detection only runs on image files and PDFs.
 - **Audio format:** Redacted output is always WAV (16 kHz 16-bit mono). The original input format is not preserved.
-- **Manual entity addition for TXT:** Manual words are added as "Manual" category entities but do not have character offsets — they fall back to case-insensitive text search at redaction time.
+- **Manual entity addition for TXT/email:** Manual words are added as "Manual" category entities with no `Source` tag. They appear in the email body preview and are applied to all email sources during redaction.
+- **Email attachment types:** Only formats already supported by the document pipeline are processed (PDF, TXT, Word, Excel, PowerPoint, images). Embedded `.zip`, `.exe`, calendar files, etc. are skipped with a log warning.
+- **Email preview shows body only:** Attachments are not previewed; they are redacted and included in the ZIP at download time.
+- **EML HTML emails:** If an EML has no plain-text part, the HTML body is stripped to text. Heavily nested HTML templates may lose some formatting context in the stripped output.
 - **Session storage:** Sessions are in-memory only. Restarting the server clears all sessions. Temp files are written to the OS temp directory and are not cleaned up automatically.
 
 ---
