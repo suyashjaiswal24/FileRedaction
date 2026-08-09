@@ -7,8 +7,8 @@ interface Props {
   initialError?: string
 }
 
-const ACCEPTED = '.pdf,.docx,.doc,.docm,.odt,.rtf,.xlsx,.xls,.ods,.pptx,.ppt,.odp,.png,.jpg,.jpeg,.tiff,.tif,.bmp,.gif,.webp'
-const ACCEPTED_LABEL = 'PDF, Word, Excel, PowerPoint, Images'
+const ACCEPTED = '.pdf,.txt,.docx,.doc,.docm,.odt,.rtf,.xlsx,.xls,.ods,.pptx,.ppt,.odp,.png,.jpg,.jpeg,.tiff,.tif,.bmp,.gif,.webp'
+const ACCEPTED_LABEL = 'PDF, TXT, Word, Excel, PowerPoint, Images'
 
 export default function FileUpload({ onUploadComplete, initialError }: Props) {
   const [dragging, setDragging] = useState(false)
