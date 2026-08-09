@@ -24,6 +24,8 @@ builder.Services.AddHttpClient(nameof(SecureRedactService), client =>
     client.Timeout = TimeSpan.FromMinutes(10); // video uploads can be large
 });
 
+builder.Services.AddScoped<IFaceDetectionService, FaceDetectionService>();
+
 // Named HttpClient for the Azure AI Language Service (PII detection)
 builder.Services.AddHttpClient(nameof(PiiDetectionService), (sp, client) =>
 {

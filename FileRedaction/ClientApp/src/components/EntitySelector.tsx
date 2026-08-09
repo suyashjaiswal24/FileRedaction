@@ -17,13 +17,13 @@ const CATEGORY_COLORS: Record<string, string> = {
   Person: '#e0f0ff', Organization: '#e6f9ee', PhoneNumber: '#fff8e1',
   Email: '#fce4ec', Address: '#f3e5f5', DateTime: '#e8f5e9',
   IPAddress: '#fff3e0', URL: '#e3f2fd', CreditCardNumber: '#fce4ec',
-  USSocialSecurityNumber: '#fce4ec', Manual: '#fdf4e7', Default: '#f5f5f5'
+  USSocialSecurityNumber: '#fce4ec', Manual: '#fdf4e7', Face: '#fce7f3', Default: '#f5f5f5'
 }
 const CATEGORY_TEXT: Record<string, string> = {
   Person: '#1565c0', Organization: '#2e7d32', PhoneNumber: '#e65100',
   Email: '#880e4f', Address: '#6a1b9a', DateTime: '#1b5e20',
   IPAddress: '#bf360c', URL: '#0d47a1', CreditCardNumber: '#880e4f',
-  USSocialSecurityNumber: '#880e4f', Manual: '#92400e', Default: '#333'
+  USSocialSecurityNumber: '#880e4f', Manual: '#92400e', Face: '#9d174d', Default: '#333'
 }
 
 function categoryStyle(cat: string): React.CSSProperties {
@@ -260,13 +260,18 @@ export default function EntitySelector({
                 onChange={() => toggle(entity.id)}
                 style={{ width: 16, height: 16, cursor: 'pointer', flexShrink: 0 }}
               />
+              {entity.category === 'Face' && (
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#9d174d" strokeWidth={2} style={{ flexShrink: 0 }}>
+                  <circle cx="12" cy="8" r="4"/><path strokeLinecap="round" d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+                </svg>
+              )}
               <span style={styles.entityText}>{entity.text}</span>
               {entity.subCategory && (
                 <span style={{ color: '#aaa', fontSize: 12, marginLeft: 4 }}>({entity.subCategory})</span>
               )}
               {entity.category !== 'Manual' ? (
                 <span style={{ marginLeft: 'auto', fontSize: 12, color: '#888', background: '#f0f0f0', padding: '1px 8px', borderRadius: 10 }}>
-                  {entity.occurrenceCount} {entity.occurrenceCount === 1 ? 'occurrence' : 'occurrences'}
+                  {entity.category === 'Face' ? 'detected' : `${entity.occurrenceCount} ${entity.occurrenceCount === 1 ? 'occurrence' : 'occurrences'}`}
                 </span>
               ) : (
                 <span style={{ marginLeft: 'auto', fontSize: 11, color: '#a16207', background: '#fef3c7', padding: '1px 8px', borderRadius: 12 }}>

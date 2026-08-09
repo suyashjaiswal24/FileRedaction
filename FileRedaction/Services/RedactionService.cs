@@ -53,6 +53,19 @@ public class RedactionService : IRedactionService
                     };
                     fragment.Page.Annotations.Add(highlight);
                 }
+
+                // Face entities in PDFs use pre-computed point coordinates
+                foreach (var box in entity.PdfFaceBoxes)
+                {
+                    var page = doc.Pages[box.PageNumber];
+                    var sq = new SquareAnnotation(page, new Aspose.Pdf.Rectangle(box.X1, box.Y1, box.X2, box.Y2))
+                    {
+                        Color = Aspose.Pdf.Color.Yellow,
+                        InteriorColor = Aspose.Pdf.Color.Yellow,
+                        Opacity = 0.45
+                    };
+                    page.Annotations.Add(sq);
+                }
             }
 
             doc.Save(previewPath);
@@ -102,6 +115,7 @@ public class RedactionService : IRedactionService
             using var doc = new Aspose.Pdf.Document(existingHighlightedPath);
 
             foreach (var entity in entitiesToAdd)
+            {
                 foreach (var fragment in FindTextFragments(doc, entity.Text))
                 {
                     var highlight = new HighlightAnnotation(fragment.Page, fragment.Rectangle)
@@ -113,6 +127,19 @@ public class RedactionService : IRedactionService
                     };
                     fragment.Page.Annotations.Add(highlight);
                 }
+
+                foreach (var box in entity.PdfFaceBoxes)
+                {
+                    var page = doc.Pages[box.PageNumber];
+                    var sq = new SquareAnnotation(page, new Aspose.Pdf.Rectangle(box.X1, box.Y1, box.X2, box.Y2))
+                    {
+                        Color = Aspose.Pdf.Color.Yellow,
+                        InteriorColor = Aspose.Pdf.Color.Yellow,
+                        Opacity = 0.45
+                    };
+                    page.Annotations.Add(sq);
+                }
+            }
 
             doc.Save(outPath);
             return outPath;
@@ -154,6 +181,23 @@ public class RedactionService : IRedactionService
                     };
                     fragment.Page.Annotations.Add(redaction);
                     redaction.Redact();
+                }
+
+                // Face boxes — no text to search, apply redaction annotation directly at stored coordinates
+                foreach (var box in entity.PdfFaceBoxes)
+                {
+                    var page = doc.Pages[box.PageNumber];
+                    var faceRedaction = new RedactionAnnotation(page, new Aspose.Pdf.Rectangle(box.X1, box.Y1, box.X2, box.Y2))
+                    {
+                        FillColor = Aspose.Pdf.Color.Black,
+                        BorderColor = Aspose.Pdf.Color.Black,
+                        Color = Aspose.Pdf.Color.Black,
+                        OverlayText = string.Empty
+                    };
+                    page.Annotations.Add(faceRedaction);
+                    faceRedaction.Redact();
+                    _logger.LogInformation("  Face redacted on page {Page} at [{X1},{Y1},{X2},{Y2}]",
+                        box.PageNumber, box.X1, box.Y1, box.X2, box.Y2);
                 }
             }
 

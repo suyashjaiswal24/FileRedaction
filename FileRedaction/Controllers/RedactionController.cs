@@ -2,6 +2,7 @@ using FileRedaction.Models;
 using FileRedaction.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.StaticFiles;
+using FaceDetectionResult = FileRedaction.Services.FaceDetectionResult;
 
 namespace FileRedaction.Controllers;
 
@@ -125,19 +126,16 @@ public class RedactionController : ControllerBase
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var docIntelligence = scope.ServiceProvider.GetRequiredService<IDocumentIntelligenceService>();
-        var piiDetection = scope.ServiceProvider.GetRequiredService<IPiiDetectionService>();
-        var sessions = scope.ServiceProvider.GetRequiredService<SessionStore>();
-        var logger = scope.ServiceProvider.GetRequiredService<ILogger<RedactionController>>();
+        var piiDetection    = scope.ServiceProvider.GetRequiredService<IPiiDetectionService>();
+        var faceDetection   = scope.ServiceProvider.GetRequiredService<IFaceDetectionService>();
+        var sessions        = scope.ServiceProvider.GetRequiredService<SessionStore>();
+        var logger          = scope.ServiceProvider.GetRequiredService<ILogger<RedactionController>>();
 
         var session = sessions.Get(sessionId);
         if (session is null) return;
 
         try
         {
-            // .txt: skip DI entirely — the file is already plain text, no OCR needed.
-            // DI extraction runs on the ORIGINAL file for everything else — Azure DI natively
-            // supports XLSX/DOCX/PPTX, so a 76KB Excel stays 76KB here instead of becoming a
-            // 6MB Aspose-converted PDF.
             session.Phase = "extracting";
             logger.LogInformation("Background: starting DI extraction for session {Id}", sessionId);
             var extraction = Path.GetExtension(filePath).Equals(".txt", StringComparison.OrdinalIgnoreCase)
@@ -160,21 +158,132 @@ public class RedactionController : ControllerBase
                 })
                 .ToList();
 
+            // Face detection — runs after PII; failures are non-fatal
+            if (faceDetection.IsConfigured)
+            {
+                session.Phase = "detecting_faces";
+                logger.LogInformation("Background: starting face detection for session {Id}", sessionId);
+                try
+                {
+                    var faceEntities = await DetectFacesAsync(filePath, faceDetection, logger);
+                    if (faceEntities.Count > 0)
+                    {
+                        entities = [..entities, ..faceEntities];
+                        logger.LogInformation("Background: {Count} face(s) detected for session {Id}", faceEntities.Count, sessionId);
+                    }
+                }
+                catch (Exception fex)
+                {
+                    logger.LogWarning(fex, "Face detection failed for session {Id} — continuing without faces", sessionId);
+                }
+            }
+
             session.Entities = entities;
-            session.Words = wordList;
-            session.Phase = string.Empty;
-            session.Status = "ready";
+            session.Words    = wordList;
+            session.Phase    = string.Empty;
+            session.Status   = "ready";
 
             logger.LogInformation("Background: processing complete for session {Id} — {Count} entities", sessionId, entities.Count);
         }
         catch (Exception ex)
         {
-            session.Status = "error";
-            session.Phase = string.Empty;
+            session.Status       = "error";
+            session.Phase        = string.Empty;
             session.ErrorMessage = ex.Message;
             logger.LogError(ex, "Background: processing failed for session {Id}", sessionId);
         }
     }
+
+    private static async Task<List<PiiEntityResult>> DetectFacesAsync(
+        string filePath, IFaceDetectionService faceDetection, ILogger logger)
+    {
+        var ext = Path.GetExtension(filePath).ToLowerInvariant();
+        const long maxFaceApiBytes = 6_000_000;
+
+        if (ImageExtensions.Contains(ext))
+        {
+            var fileSize = new FileInfo(filePath).Length;
+            if (fileSize > maxFaceApiBytes)
+            {
+                logger.LogWarning("Image {File} ({Size:N0} bytes) exceeds Face API 6 MB limit — skipping face detection", filePath, fileSize);
+                return [];
+            }
+
+            await using var stream = System.IO.File.OpenRead(filePath);
+            var faces = await faceDetection.DetectFacesAsync(stream);
+            return faces.Select((f, i) => FaceToImageEntity(f, i + 1, pageNumber: 1)).ToList();
+        }
+
+        if (ext == ".pdf")
+        {
+            const float renderDpi   = 150f;
+            const float ptsPerInch  = 72f;
+            float       scaleToPts  = ptsPerInch / renderDpi;
+
+            var results = new List<PiiEntityResult>();
+            int faceIndex = 1;
+
+            using var doc = new Aspose.Pdf.Document(filePath);
+            var resolution = new Aspose.Pdf.Devices.Resolution((int)renderDpi);
+            var pngDevice  = new Aspose.Pdf.Devices.PngDevice(resolution);
+
+            for (int pageNum = 1; pageNum <= doc.Pages.Count; pageNum++)
+            {
+                using var ms = new MemoryStream();
+                pngDevice.Process(doc.Pages[pageNum], ms);
+                ms.Position = 0;
+
+                var faces = await faceDetection.DetectFacesAsync(ms);
+                if (faces.Count == 0) continue;
+
+                float pageHeightPts = (float)doc.Pages[pageNum].Rect.Height;
+
+                foreach (var f in faces)
+                {
+                    // Convert pixel coords (at renderDpi) → Aspose.Pdf points (origin bottom-left)
+                    float x1 = f.Left * scaleToPts;
+                    float x2 = (f.Left + f.Width)  * scaleToPts;
+                    float y1 = pageHeightPts - (f.Top + f.Height) * scaleToPts;  // bottom
+                    float y2 = pageHeightPts - f.Top * scaleToPts;               // top
+
+                    results.Add(new PiiEntityResult
+                    {
+                        Id              = Guid.NewGuid().ToString("N")[..8],
+                        Text            = $"Face #{faceIndex++}",
+                        Category        = "Face",
+                        SubCategory     = string.Empty,
+                        ConfidenceScore = 1.0,
+                        OccurrenceCount = 1,
+                        PdfFaceBoxes    = [new PdfFaceBox { PageNumber = pageNum, X1 = x1, Y1 = y1, X2 = x2, Y2 = y2 }]
+                    });
+                }
+            }
+
+            return results;
+        }
+
+        return [];
+    }
+
+    private static PiiEntityResult FaceToImageEntity(FaceDetectionResult f, int index, int pageNumber) =>
+        new()
+        {
+            Id              = Guid.NewGuid().ToString("N")[..8],
+            Text            = $"Face #{index}",
+            Category        = "Face",
+            SubCategory     = string.Empty,
+            ConfidenceScore = 1.0,
+            OccurrenceCount = 1,
+            BoundingRegions =
+            [
+                new BoundingRegion
+                {
+                    PageNumber   = pageNumber,
+                    IsPixelUnit  = true,
+                    Polygon      = [f.Left, f.Top, f.Left + f.Width, f.Top, f.Left + f.Width, f.Top + f.Height, f.Left, f.Top + f.Height]
+                }
+            ]
+        };
 
     /// <summary>
     /// Converts Office file to PDF on first preview/redact request and caches the path.

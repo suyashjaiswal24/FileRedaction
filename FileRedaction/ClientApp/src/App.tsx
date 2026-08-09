@@ -12,10 +12,18 @@ type Mode = 'document' | 'audio' | 'video'
 
 const STEPS = ['Upload', 'Select PII', 'Preview', 'Redact']
 
-const PHASE_LABELS: Record<string, string> = {
-  extracting: 'Extracting text with Azure Document Intelligence…',
-  detecting: 'Detecting PII entities…',
-  '': 'Finalising…'
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'tiff', 'tif', 'bmp', 'gif', 'webp'])
+
+function phaseLabel(phase: string, fileName: string): string {
+  const ext = fileName.split('.').pop()?.toLowerCase() ?? ''
+  if (phase === 'extracting') {
+    if (IMAGE_EXTS.has(ext)) return 'Analyzing image with Azure Document Intelligence…'
+    if (ext === 'txt')        return 'Reading plain text file…'
+    return 'Extracting text with Azure Document Intelligence…'
+  }
+  if (phase === 'detecting') return 'Detecting PII entities…'
+  if (phase === 'detecting_faces') return 'Detecting faces with Azure Face API…'
+  return 'Finalising…'
 }
 
 export default function App() {
@@ -180,9 +188,13 @@ export default function App() {
           <div style={{ maxWidth: 480, margin: '80px auto', textAlign: 'center' }}>
             <div style={styles.doneCard}>
               <div style={styles.spinner} />
-              <h2 style={{ fontSize: 20, fontWeight: 700, margin: '20px 0 8px' }}>Analysing document…</h2>
+              <h2 style={{ fontSize: 20, fontWeight: 700, margin: '20px 0 8px' }}>
+                {IMAGE_EXTS.has(processingSession.originalFileName.split('.').pop()?.toLowerCase() ?? '')
+                  ? 'Analysing image…'
+                  : 'Analysing document…'}
+              </h2>
               <p style={{ color: '#555', fontSize: 14 }}>
-                {PHASE_LABELS[processingPhase] ?? PHASE_LABELS['']}
+                {phaseLabel(processingPhase, processingSession.originalFileName)}
               </p>
               <p style={{ color: '#aaa', fontSize: 12, marginTop: 8 }}>{processingSession.originalFileName}</p>
             </div>
