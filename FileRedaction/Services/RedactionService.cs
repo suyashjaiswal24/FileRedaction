@@ -42,19 +42,40 @@ public class RedactionService : IRedactionService
 
             foreach (var entity in selectedEntities)
             {
-                foreach (var fragment in FindTextFragments(doc, entity.Text))
+                var fragments = FindTextFragments(doc, entity.Text);
+                if (fragments.Count > 0)
                 {
-                    var highlight = new HighlightAnnotation(fragment.Page, fragment.Rectangle)
+                    foreach (var fragment in fragments)
                     {
-                        Color = Aspose.Pdf.Color.Yellow,
-                        Opacity = 0.5,
-                        Title = entity.Category,
-                        Contents = $"{entity.Category}: {entity.Text}"
-                    };
-                    fragment.Page.Annotations.Add(highlight);
+                        var highlight = new HighlightAnnotation(fragment.Page, fragment.Rectangle)
+                        {
+                            Color = Aspose.Pdf.Color.Yellow,
+                            Opacity = 0.5,
+                            Title = entity.Category,
+                            Contents = $"{entity.Category}: {entity.Text}"
+                        };
+                        fragment.Page.Annotations.Add(highlight);
+                    }
+                }
+                else
+                {
+                    // Text is inside an embedded image — TextFragmentAbsorber can't find it.
+                    // Fall back to DI bounding regions (inch coordinates → PDF points).
+                    foreach (var region in entity.BoundingRegions.Where(r => !r.IsPixelUnit))
+                    {
+                        var page = doc.Pages[region.PageNumber];
+                        var rect = BoundingRegionToPdfRect(region, page);
+                        if (rect is null) continue;
+                        var sq = new SquareAnnotation(page, rect)
+                        {
+                            Color = Aspose.Pdf.Color.Yellow,
+                            InteriorColor = Aspose.Pdf.Color.Yellow,
+                            Opacity = 0.45
+                        };
+                        page.Annotations.Add(sq);
+                    }
                 }
 
-                // Face entities in PDFs use pre-computed point coordinates
                 foreach (var box in entity.PdfFaceBoxes)
                 {
                     var page = doc.Pages[box.PageNumber];
@@ -116,16 +137,36 @@ public class RedactionService : IRedactionService
 
             foreach (var entity in entitiesToAdd)
             {
-                foreach (var fragment in FindTextFragments(doc, entity.Text))
+                var fragments = FindTextFragments(doc, entity.Text);
+                if (fragments.Count > 0)
                 {
-                    var highlight = new HighlightAnnotation(fragment.Page, fragment.Rectangle)
+                    foreach (var fragment in fragments)
                     {
-                        Color = Aspose.Pdf.Color.Yellow,
-                        Opacity = 0.5,
-                        Title = entity.Category,
-                        Contents = $"{entity.Category}: {entity.Text}"
-                    };
-                    fragment.Page.Annotations.Add(highlight);
+                        var highlight = new HighlightAnnotation(fragment.Page, fragment.Rectangle)
+                        {
+                            Color = Aspose.Pdf.Color.Yellow,
+                            Opacity = 0.5,
+                            Title = entity.Category,
+                            Contents = $"{entity.Category}: {entity.Text}"
+                        };
+                        fragment.Page.Annotations.Add(highlight);
+                    }
+                }
+                else
+                {
+                    foreach (var region in entity.BoundingRegions.Where(r => !r.IsPixelUnit))
+                    {
+                        var page = doc.Pages[region.PageNumber];
+                        var rect = BoundingRegionToPdfRect(region, page);
+                        if (rect is null) continue;
+                        var sq = new SquareAnnotation(page, rect)
+                        {
+                            Color = Aspose.Pdf.Color.Yellow,
+                            InteriorColor = Aspose.Pdf.Color.Yellow,
+                            Opacity = 0.45
+                        };
+                        page.Annotations.Add(sq);
+                    }
                 }
 
                 foreach (var box in entity.PdfFaceBoxes)
@@ -164,23 +205,47 @@ public class RedactionService : IRedactionService
             foreach (var entity in selectedEntities)
             {
                 var fragments = FindTextFragments(doc, entity.Text);
-                _logger.LogInformation("Redacting '{Text}' — {Count} occurrence(s)", entity.Text, fragments.Count);
+                _logger.LogInformation("Redacting '{Text}' — {Count} occurrence(s) in text layer", entity.Text, fragments.Count);
 
-                foreach (var fragment in fragments)
+                if (fragments.Count > 0)
                 {
-                    var rect = new Aspose.Pdf.Rectangle(
-                        fragment.Rectangle.LLX - 1, fragment.Rectangle.LLY - 1,
-                        fragment.Rectangle.URX + 1, fragment.Rectangle.URY + 1);
-
-                    var redaction = new RedactionAnnotation(fragment.Page, rect)
+                    foreach (var fragment in fragments)
                     {
-                        FillColor = Aspose.Pdf.Color.Black,
-                        BorderColor = Aspose.Pdf.Color.Black,
-                        Color = Aspose.Pdf.Color.Black,
-                        OverlayText = string.Empty
-                    };
-                    fragment.Page.Annotations.Add(redaction);
-                    redaction.Redact();
+                        var rect = new Aspose.Pdf.Rectangle(
+                            fragment.Rectangle.LLX - 1, fragment.Rectangle.LLY - 1,
+                            fragment.Rectangle.URX + 1, fragment.Rectangle.URY + 1);
+
+                        var redaction = new RedactionAnnotation(fragment.Page, rect)
+                        {
+                            FillColor = Aspose.Pdf.Color.Black,
+                            BorderColor = Aspose.Pdf.Color.Black,
+                            Color = Aspose.Pdf.Color.Black,
+                            OverlayText = string.Empty
+                        };
+                        fragment.Page.Annotations.Add(redaction);
+                        redaction.Redact();
+                    }
+                }
+                else
+                {
+                    // Text is inside an embedded image — paint a black box over the DI bounding region.
+                    foreach (var region in entity.BoundingRegions.Where(r => !r.IsPixelUnit))
+                    {
+                        var page = doc.Pages[region.PageNumber];
+                        var rect = BoundingRegionToPdfRect(region, page);
+                        if (rect is null) continue;
+                        var expanded = new Aspose.Pdf.Rectangle(rect.LLX - 1, rect.LLY - 1, rect.URX + 1, rect.URY + 1);
+                        var redaction = new RedactionAnnotation(page, expanded)
+                        {
+                            FillColor = Aspose.Pdf.Color.Black,
+                            BorderColor = Aspose.Pdf.Color.Black,
+                            Color = Aspose.Pdf.Color.Black,
+                            OverlayText = string.Empty
+                        };
+                        page.Annotations.Add(redaction);
+                        redaction.Redact();
+                        _logger.LogInformation("  Embedded-image text redacted on page {Page}", region.PageNumber);
+                    }
                 }
 
                 // Face boxes — no text to search, apply redaction annotation directly at stored coordinates
@@ -350,6 +415,27 @@ public class RedactionService : IRedactionService
     }
 
     // ── PDF helpers ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Converts a DI bounding polygon (inches, Y increases downward) to an Aspose.Pdf Rectangle
+    /// (points = inches × 72, Y increases upward from page bottom).
+    /// </summary>
+    private static Aspose.Pdf.Rectangle? BoundingRegionToPdfRect(BoundingRegion region, Aspose.Pdf.Page page)
+    {
+        var poly = region.Polygon;
+        if (poly.Length < 8) return null;
+
+        var xs = new[] { poly[0], poly[2], poly[4], poly[6] };
+        var ys = new[] { poly[1], poly[3], poly[5], poly[7] };
+
+        double pageHeight = page.Rect.Height; // page height in PDF points
+        double llx = xs.Min() * 72;
+        double urx = xs.Max() * 72;
+        double ury = pageHeight - ys.Min() * 72; // DI top edge (small Y) → PDF high Y
+        double lly = pageHeight - ys.Max() * 72; // DI bottom edge (large Y) → PDF low Y
+
+        return new Aspose.Pdf.Rectangle(llx, lly, urx, ury);
+    }
 
     private static List<TextFragment> FindTextFragments(Aspose.Pdf.Document doc, string entityText)
     {

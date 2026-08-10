@@ -684,19 +684,22 @@ public class RedactionController : ControllerBase
             return Conflict("This word/phrase has already been added manually.");
         }
 
-        // For image files: resolve bounding regions now using the stored DI word list
-        var ext = Path.GetExtension(session.FilePath).ToLowerInvariant();
-        List<BoundingRegion> regions = ImageExtensions.Contains(ext)
-            ? session.Words
-                .Where(w => w.Text.Contains(request.Text.Trim(), StringComparison.OrdinalIgnoreCase))
-                .Select(w => new BoundingRegion
-                {
-                    PageNumber = w.PageNumber,
-                    Polygon = w.Polygon,
-                    IsPixelUnit = w.IsPixelUnit
-                })
-                .ToList()
-            : new List<BoundingRegion>(); // PDF: TextFragmentAbsorber resolves at redaction time
+        // Resolve bounding regions from DI word list for all file types.
+        // Images: always needed (no TextFragmentAbsorber).
+        // PDFs: needed as fallback for text inside embedded images (TextFragmentAbsorber only
+        //       sees the text layer; the fallback in RedactionService uses these regions when
+        //       the absorber returns zero matches).
+        var trimmed = request.Text.Trim();
+        List<BoundingRegion> regions = session.Words
+            .Where(w => trimmed.Contains(w.Text, StringComparison.OrdinalIgnoreCase) ||
+                        w.Text.Contains(trimmed, StringComparison.OrdinalIgnoreCase))
+            .Select(w => new BoundingRegion
+            {
+                PageNumber = w.PageNumber,
+                Polygon = w.Polygon,
+                IsPixelUnit = w.IsPixelUnit
+            })
+            .ToList();
 
         var entity = new PiiEntityResult
         {

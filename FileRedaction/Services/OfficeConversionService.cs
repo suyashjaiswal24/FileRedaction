@@ -78,6 +78,20 @@ public class OfficeConversionService : IOfficeConversionService
     public string ExportExcelToHtml(string xlsxPath)
     {
         var wb = new Aspose.Cells.Workbook(xlsxPath);
+
+        // Restrict each sheet's print area to the actual data range so the HTML
+        // export omits empty trailing rows and columns.
+        foreach (var ws in wb.Worksheets)
+        {
+            int lastRow = ws.Cells.MaxDataRow;
+            int lastCol = ws.Cells.MaxDataColumn;
+            if (lastRow >= 0 && lastCol >= 0)
+            {
+                var range = ws.Cells.CreateRange(0, 0, lastRow + 1, lastCol + 1);
+                ws.PageSetup.PrintArea = range.RefersTo;
+            }
+        }
+
         var outDir = Path.Combine(Path.GetTempPath(), $"preview_{Guid.NewGuid():N}");
         Directory.CreateDirectory(outDir);
         var outPath = Path.Combine(outDir, "preview.html");
