@@ -3,6 +3,7 @@ using ImageMagick;
 using ImageMagick.Drawing;
 using PdfSharp.Drawing;
 using PdfSharp.Pdf;
+using PdfSharp.Pdf.Annotations;
 using PdfSharp.Pdf.IO;
 using PDFtoImage;
 using SkiaSharp;
@@ -81,8 +82,10 @@ public class RedactionService : IRedactionService
         _logger.LogInformation("Creating highlighted PDF preview → {Path}", outPath);
 
         using var doc = PdfReader.Open(sourcePath, PdfDocumentOpenMode.Modify);
+        // Compression is off for now. To enable it, set this to true: it roughly halves output size for PDFs
+        // whose text streams are stored uncompressed (3.5 MB -> 1.7 MB on a 972-page sample) at almost no time cost.
+        doc.Options.CompressContentStreams = false;
         var byPage = CollectPdfBoxes(entities, sourcePath);
-        var brush = new XSolidBrush(XColor.FromArgb(120, 255, 235, 0));
 
         foreach (var (pageNumber, boxes) in byPage)
         {
@@ -90,9 +93,27 @@ public class RedactionService : IRedactionService
             var page = doc.Pages[pageNumber - 1];
             double pageHeight = page.Height.Point;
 
-            using var gfx = XGraphics.FromPdfPage(page, XGraphicsPdfPageOptions.Append);
+            // Real PDF highlight annotation (like a highlighter pen): the text stays visible and selectable
+            // underneath the translucent yellow band.
             foreach (var r in boxes.Resolve(pageHeight))
-                gfx.DrawRectangle(brush, r.X, r.Y, r.Width, r.Height);
+            {
+                double top = pageHeight - r.Y;
+                double bottom = pageHeight - (r.Y + r.Height);
+                var quad = new PdfArray(doc,
+                    new PdfReal(r.X), new PdfReal(top),
+                    new PdfReal(r.X + r.Width), new PdfReal(top),
+                    new PdfReal(r.X), new PdfReal(bottom),
+                    new PdfReal(r.X + r.Width), new PdfReal(bottom));
+
+                // PdfLinkAnnotation is the concrete public annotation type; /Subtype is overwritten to /Highlight.
+                var annot = new PdfLinkAnnotation(doc);
+                annot.Elements["/Subtype"] = new PdfName("/Highlight");
+                annot.Rectangle = new PdfRectangle(new XPoint(r.X, bottom), new XPoint(r.X + r.Width, top));
+                annot.Elements["/QuadPoints"] = quad;
+                annot.Color = XColor.FromArgb(255, 255, 235, 0);
+                annot.Opacity = 0.5;
+                page.Annotations.Add(annot);
+            }
         }
 
         doc.Save(outPath);
@@ -103,21 +124,67 @@ public class RedactionService : IRedactionService
 
     private string RedactPdf(string filePath, List<PiiEntityResult> entities)
     {
-        var outPath = Path.Combine(Path.GetTempPath(), $"redacted_{Guid.NewGuid():N}.pdf");
-        _logger.LogInformation("Applying permanent PDF redaction → {Path}", outPath);
-
         var byPage = CollectPdfBoxes(entities, filePath);
         _logger.LogInformation("PDF redaction: {Pages} page(s) with boxes, {Boxes} box(es) total", byPage.Count, byPage.Values.Sum(b => b.Count));
         if (byPage.Count == 0)
             _logger.LogWarning("No redaction boxes were located in the PDF — output will be identical to the input");
 
+        var outPath = BuildRedactedPdf(filePath, byPage, []);
+
+        // Safety net: re-read the result; any page that still has text under a box is redone as a raster page.
+        var failed = VerifyRedaction(outPath, byPage);
+        if (failed.Count > 0)
+        {
+            _logger.LogWarning("Text still found under redaction boxes on page(s) {Pages} — rasterising them", string.Join(",", failed));
+            File.Delete(outPath);
+            outPath = BuildRedactedPdf(filePath, byPage, failed);
+        }
+
+        return outPath;
+    }
+
+    /// <summary>Returns the pages of the redacted PDF that still contain text inside a redaction box.</summary>
+    private HashSet<int> VerifyRedaction(string outPath, Dictionary<int, PageBoxes> byPage)
+    {
+        var failed = new HashSet<int>();
+        if (byPage.Count == 0) return failed;
+
+        using var doc = PigDocument.Open(outPath);
+        foreach (var (pageNumber, boxes) in byPage)
+        {
+            if (pageNumber < 1 || pageNumber > doc.NumberOfPages) continue;
+            var page = doc.GetPage(pageNumber);
+            var rects = boxes.Resolve(page.Height).ToList();
+            foreach (var l in page.Letters)
+            {
+                if (string.IsNullOrWhiteSpace(l.Value)) continue;
+                var bb = l.BoundingBox;
+                double cx = (bb.Left + bb.Right) / 2;
+                double cy = page.Height - (bb.Top + bb.Bottom) / 2;
+                if (rects.Any(r => cx >= r.X && cx <= r.X + r.Width && cy >= r.Y && cy <= r.Y + r.Height))
+                { failed.Add(pageNumber); break; }
+            }
+        }
+        return failed;
+    }
+
+    private string BuildRedactedPdf(string filePath, Dictionary<int, PageBoxes> byPage, HashSet<int> forceRaster)
+    {
+        var outPath = Path.Combine(Path.GetTempPath(), $"redacted_{Guid.NewGuid():N}.pdf");
+        _logger.LogInformation("Writing redacted PDF → {Path}", outPath);
+
         var pdfBytes = File.ReadAllBytes(filePath);
         var keepAlive = new List<IDisposable>();
+        int glyphPages = 0, rasterPages = 0;
 
         try
         {
+            using var pig = byPage.Count > 0 ? PigDocument.Open(filePath) : null;
             using var source = PdfReader.Open(new MemoryStream(pdfBytes), PdfDocumentOpenMode.Import);
             using var output = new PdfDocument();
+            // Compression is off for now. To enable it, set this to true: it roughly halves output size for PDFs
+            // whose text streams are stored uncompressed (3.5 MB -> 1.7 MB on a 972-page sample) at almost no time cost.
+            output.Options.CompressContentStreams = false;
             output.Info.Title = source.Info.Title;
 
             for (int i = 0; i < source.PageCount; i++)
@@ -129,6 +196,15 @@ public class RedactionService : IRedactionService
                     output.AddPage(source.Pages[i]);   // untouched page — copied as-is
                     continue;
                 }
+
+                // Preferred: delete just the glyphs under the boxes from the page's content stream
+                // (page stays vector — small, and all other text remains selectable).
+                if (pig is not null && !forceRaster.Contains(pageNumber) && TryGlyphRedact(output, source.Pages[i], pig.GetPage(pageNumber), boxes, pageNumber))
+                {
+                    glyphPages++;
+                    continue;
+                }
+                rasterPages++;
 
                 var pageSize = Conversion.GetPageSize(new MemoryStream(pdfBytes), i, false, null);
                 using var bitmap = Conversion.ToImage(
@@ -174,7 +250,68 @@ public class RedactionService : IRedactionService
             foreach (var d in keepAlive) d.Dispose();
         }
 
+        _logger.LogInformation("PDF redaction done: {Glyph} page(s) edited in place, {Raster} page(s) rasterised", glyphPages, rasterPages);
         return outPath;
+    }
+
+    /// <summary>
+    /// Copies the page into <paramref name="output"/> with the text under each box removed from its content
+    /// stream, then paints black boxes over the spots. Returns false (nothing added) if the page isn't supported.
+    /// </summary>
+    private bool TryGlyphRedact(PdfDocument output, PdfPage srcPage, UglyToad.PdfPig.Content.Page pigPage, PageBoxes boxes, int pageNumber)
+    {
+        double pageHeight = srcPage.Height.Point;
+        var rects = boxes.Resolve(pageHeight)
+            .Select(b => new PdfGlyphRedactor.Rect(b.X, b.Y, b.Width, b.Height)).ToList();
+
+        if (!PdfGlyphRedactor.TryBuildContent(srcPage, pigPage, rects, RedactPaddingPts, out var newContent, out var reason))
+        {
+            _logger.LogInformation("  Page {Page}: glyph removal not possible ({Reason}) — rasterising", pageNumber, reason);
+            return false;
+        }
+
+        var outPage = output.AddPage(srcPage);
+        // Merge into one stream, then edit the stream object the page actually references
+        // (CreateSingleContent's return value is not the one that gets saved).
+        outPage.Contents.CreateSingleContent();
+        var content = (outPage.Contents.Elements[0] as PdfSharp.Pdf.Advanced.PdfReference)?.Value as PdfDictionary
+            ?? throw new InvalidOperationException("Page content stream not found");
+        content.Elements.Remove("/Filter");
+        content.Elements.Remove("/DecodeParms");
+        content.Stream!.Value = newContent;
+
+        // Annotations (links, comments) whose area overlaps a box could carry the text — drop those.
+        try
+        {
+            for (int a = outPage.Annotations.Count - 1; a >= 0; a--)
+            {
+                var rect = outPage.Annotations[a].Rectangle;
+                double aTop = Math.Max(rect.Y1, rect.Y2), aBottom = Math.Min(rect.Y1, rect.Y2);
+                double aLeft = Math.Min(rect.X1, rect.X2), aRight = Math.Max(rect.X1, rect.X2);
+                bool hit = rects.Any(r =>
+                {
+                    double bTop = pageHeight - r.Y, bBottom = pageHeight - (r.Y + r.Height);
+                    return aLeft <= r.X + r.Width && aRight >= r.X && aBottom <= bTop && aTop >= bBottom;
+                });
+                if (hit) outPage.Annotations.Remove(outPage.Annotations[a]);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "  Page {Page}: could not inspect annotations — removing all of them", pageNumber);
+            outPage.Elements.Remove("/Annots");
+        }
+
+        using (var gfx = XGraphics.FromPdfPage(outPage, XGraphicsPdfPageOptions.Append))
+        {
+            foreach (var r in rects)
+                gfx.DrawRectangle(XBrushes.Black,
+                    r.X - RedactPaddingPts, r.Y - RedactPaddingPts,
+                    r.Width + 2 * RedactPaddingPts, r.Height + 2 * RedactPaddingPts);
+        }
+
+        _logger.LogInformation("  Page {Page}: glyphs removed, {Count} box(es) painted", pageNumber, rects.Count);
+        return true;
     }
 
     // ── PDF helpers ──────────────────────────────────────────────────────────
