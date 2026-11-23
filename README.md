@@ -39,7 +39,7 @@ Two things run **in parallel** from the moment the file is uploaded, while the b
 - **Images (PNG, JPG, etc.):** Sent to **Azure Document Intelligence** (`prebuilt-read` model) which uses OCR to find every word and its pixel position on the image.
   - If the image is larger than 4 MB, it is compressed (resized) before sending to DI, then the pixel coordinates are scaled back to the original image size so highlights land in the right place.
 - **PDFs:** Sent to **Azure Document Intelligence** which extracts text with exact bounding box coordinates in points (1 point = 1/72 inch). DI processes all pages internally in one API call — Azure's servers handle per-page parallelism server-side.
-- **Office files (Word, Excel, PowerPoint):** Also sent to Azure Document Intelligence. Additionally, they are lazily converted to PDF using **Aspose** the first time a preview is needed.
+- **Office files (Word, Excel, PowerPoint):** Also sent to Azure Document Intelligence. Additionally, Word/PowerPoint are lazily converted to PDF using **OfficeIMO** the first time a preview is needed.
 
 Once DI finishes, the extracted text is sent to **Azure AI Language Service** for PII detection. The Language Service returns entities (Person, PhoneNumber, Email, IBAN, etc.) with category, confidence score, and exact character offset + length. If an entity appears multiple times, all occurrences are tracked.
 
@@ -48,7 +48,7 @@ Once DI finishes, the extracted text is sent to **Azure AI Language Service** fo
 - Starts at the same time as DI — it only needs the original file, not the DI output.
 - Face API is fast (~300 ms per image). DI is slow (3–10 s for a typical document). By the time DI + PII finish, the face results are almost always already waiting.
 - For image files: sent directly to **Azure Face API** (up to 6 MB limit).
-- For PDFs: each page is rendered to PNG at 150 DPI using **Aspose.PDF**, then all pages are sent to the Face API **in parallel** (`Task.WhenAll`). This is important for scanned government documents (Aadhaar, PAN card) which are almost always uploaded as PDFs — the face photo in the scan is detected alongside the text PII.
+- For PDFs: automatic face detection is no longer run (pages are not rasterised); faces on PDF pages are handled with the manual redaction tool in the document preview.
 - Each detected face becomes a "Face #1", "Face #2" etc. entity.
 - Face detection failures are non-fatal — the app continues without faces if the API is unavailable.
 
@@ -79,7 +79,7 @@ Once DI finishes, the extracted text is sent to **Azure AI Language Service** fo
 | **Image** (PNG, JPG, etc.) | Black rectangles are drawn directly onto the image pixels at the bounding box positions returned by Document Intelligence. |
 | **TXT** | Each entity's text is found by case-insensitive text search (longest entity first to avoid partial overlaps) and replaced with `█` characters. Downloaded as `.txt`. |
 | **Excel** | Cell values containing PII text are replaced with `█████` in the spreadsheet. Downloaded as `.xlsx`. |
-| **Word / PowerPoint** | Converted to PDF first (Aspose), then redacted the same as PDF. |
+| **Word / PowerPoint** | Converted to PDF first (OfficeIMO), then redacted the same as PDF. |
 | **Email (.eml/.msg)** | Each source (body + each attachment) is redacted independently using its own format's pipeline, then all redacted files are packaged into a single `.zip` for download. |
 
 - The redacted file is automatically downloaded by the browser.
@@ -166,11 +166,10 @@ Authentication is OAuth2 client credentials — the token is cached and reused u
 
 | Library | Purpose |
 |---------|---------|
-| **Aspose.PDF** | PDF highlight preview, permanent redaction (black boxes), Office→PDF conversion, rendering PDF pages to PNG for face detection |
-| **Aspose.Words** | Word/RTF/ODT → PDF conversion |
-| **Aspose.Cells** | Excel highlight preview, Excel redaction, Excel → HTML export for inline preview |
-| **Aspose.Slides** | PowerPoint → PDF conversion |
-| **Aspose.Drawing** | Image compression (resize large images before sending to Azure DI), bitmap manipulation (indexed pixel format handling for barcodes) |
+| **PDFsharp 6.2.4** (MIT) | Highlight preview on PDFs, assembling the redacted PDF. **Do not upgrade to 6.5+ — it is AGPL with a runtime licence check.** |
+| **PDFtoImage** (MIT, PDFium) + **SkiaSharp** (MIT) | Renders pages that contain redactions, paints black boxes |
+| **Magick.NET** (Apache-2.0) | Image highlight/redaction, compression before Azure DI |
+| **OfficeIMO** (MIT) | Word/PowerPoint → PDF, Excel highlight/redact/HTML preview |
 | **MimeKit** (4.8.0) | Parse `.eml` files — extract headers, text/plain body, HTML body, and attachments |
 | **MSGReader** (3.6.0) | Parse `.msg` Outlook files — extract headers, RTF→text body, and attachments. Read-only, MIT licensed, no Aspose.Email dependency. |
 | **NAudio** | Decode any audio format to PCM WAV, write redacted WAV with beep tones |
@@ -243,7 +242,7 @@ All endpoints are under `/api/redaction/` (documents), `/api/audio/` (audio), an
 | `POST` | `/api/redaction/preview` | Generate a highlighted preview. Returns a URL to the preview file. |
 | `POST` | `/api/redaction/redact` | Apply permanent redaction. Streams the redacted file for download. |
 | `GET` | `/api/redaction/file/{token}` | Serves a temp file by base64-encoded path token (restricted to system temp dir). |
-| `GET` | `/api/redaction/preview-html/{dirToken}/{*path}` | Serves Aspose-generated Excel HTML previews (multi-file with CSS/sheet companions). |
+| `GET` | `/api/redaction/preview-html/{dirToken}/{*path}` | Serves generated Excel HTML previews (multi-file with CSS/sheet companions). |
 
 ### Processing Phases (returned in `/status`)
 
@@ -268,7 +267,7 @@ FileRedaction/
 ├── Services/
 │   ├── DocumentIntelligenceService.cs # Azure DI wrapper. Handles image compression + coord scaling.
 │   ├── PiiDetectionService.cs         # Azure Language Service wrapper. Chunks by page, deduplicates entities.
-│   ├── RedactionService.cs            # PDF/image highlight preview + permanent black-box redaction (Aspose.PDF).
+│   ├── RedactionService.cs            # PDF/image highlight preview + permanent black-box redaction (PDFium + PDFsharp).
 │   │                                  # Also handles indexed pixel format images (barcodes) via ToArgb32 helper.
 │   ├── OfficeConversionService.cs     # Office→PDF conversion, Excel highlight/redact, Excel→HTML export.
 │   ├── FaceDetectionService.cs        # Azure Face API wrapper. Returns pixel bounding boxes per face.
@@ -315,7 +314,7 @@ Face detection only needs the original file path — it has no dependency on DI'
 Azure DI accepts the whole document as a single API call and parallelises pages internally on Azure's servers. If we split a PDF into individual pages and sent N separate calls: (1) each page's text would start at character offset 0, breaking the offset-based PII and redaction logic; (2) language detection would be less accurate per-page; (3) N round-trip API overheads instead of 1. It would be slower, not faster.
 
 ### Why coordinates need scaling (images)
-Azure Document Intelligence has a 4 MB limit for images on the free tier. Large images (e.g. a 5 MB photo of an ID card) are compressed to JPEG before being sent to DI. DI returns word positions relative to the compressed image. The app captures the original image dimensions before compression and scales all returned coordinates back up — so when Aspose draws black boxes, they land on the right pixels in the original image.
+Azure Document Intelligence has a 4 MB limit for images on the free tier. Large images (e.g. a 5 MB photo of an ID card) are compressed to JPEG before being sent to DI. DI returns word positions relative to the compressed image. The app captures the original image dimensions before compression and scales all returned coordinates back up — so when the black boxes are drawn, they land on the right pixels in the original image.
 
 ### Why face coordinates need conversion (PDFs)
 The Face API returns pixel positions. PDFs use a point coordinate system (72 points per inch) with the origin at the **bottom-left** corner of the page. When rendering a PDF page at 150 DPI:
@@ -327,7 +326,7 @@ The Face API returns pixel positions. PDFs use a point coordinate system (72 poi
 Azure Language Service returns character offsets, but those offsets are relative to the exact UTF-16 string it received. Line ending differences (`\r\n` vs `\n`), BOM handling, and encoding edge cases can all cause progressive drift between Azure's offset and the .NET string index, making highlights land on the wrong characters. Rather than trying to perfectly reconcile all these edge cases, TXT highlighting and redaction use **case-insensitive text search** (`IndexOf` / `ReplaceTextCaseInsensitive`), the same approach as PDF (`TextFragmentAbsorber`) and Excel (cell value matching). Longer entities are searched first to avoid partial-word replacements (e.g. "Swiggy instamart" before "Swiggy").
 
 ### Why Excel preview is shown as HTML (not PDF)
-Aspose.Cells exports Excel to a multi-file HTML bundle (a `preview.html` with companion CSS and per-sheet `.htm` files). This HTML uses JavaScript for tab switching, so it must be served in a plain `<iframe>` — no `sandbox` attribute, because sandbox blocks inline scripts.
+OfficeIMO exports Excel to a multi-file HTML bundle (a `preview.html` with companion CSS and per-sheet `.htm` files). This HTML uses JavaScript for tab switching, so it must be served in a plain `<iframe>` — no `sandbox` attribute, because sandbox blocks inline scripts.
 
 ### Why barcode images fail without special handling
 GDI+ (Windows imaging library) cannot create a `Graphics` object from a 1-bit or 8-bit indexed bitmap (barcodes are typically 1bpp black-and-white). The `ToArgb32` helper converts any indexed-format bitmap to a 32-bit ARGB copy first, then drawing proceeds normally.

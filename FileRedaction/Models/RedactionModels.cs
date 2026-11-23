@@ -46,7 +46,7 @@ public class PiiEntityResult
     /// </summary>
     public List<(int Offset, int Length)> CharRanges { get; set; } = new();
     /// <summary>
-    /// Face bounding boxes in PDF point coordinates (Aspose.Pdf system: origin at bottom-left).
+    /// Face bounding boxes in PDF point coordinates (PDF point system: origin at bottom-left).
     /// Only populated for Face entities detected in PDF files.
     /// Image-file faces use BoundingRegions instead (IsPixelUnit = true).
     /// </summary>
@@ -55,7 +55,7 @@ public class PiiEntityResult
     public string Source { get; set; } = string.Empty;
 }
 
-/// <summary>Face bounding box in Aspose.Pdf point coordinates (72 pts/inch, origin bottom-left).</summary>
+/// <summary>Face bounding box in PDF point coordinates (72 pts/inch, origin bottom-left).</summary>
 public class PdfFaceBox
 {
     public int PageNumber { get; set; }

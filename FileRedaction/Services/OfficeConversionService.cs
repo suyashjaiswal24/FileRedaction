@@ -1,3 +1,7 @@
+using OfficeIMO;
+using OfficeIMO.Excel;
+using OfficeIMO.Excel.Html;
+
 namespace FileRedaction.Services;
 
 public interface IOfficeConversionService
@@ -35,31 +39,20 @@ public class OfficeConversionService : IOfficeConversionService
         var ext = Path.GetExtension(filePath).ToLowerInvariant();
         var outPath = Path.ChangeExtension(filePath, ".pdf");
 
-        if (WordExts.Contains(ext))
-        {
-            var doc = new Aspose.Words.Document(filePath);
-            doc.Save(outPath, Aspose.Words.SaveFormat.Pdf);
-        }
-        else if (CellsExts.Contains(ext))
-        {
+        if (CellsExts.Contains(ext))
             throw new NotSupportedException("Excel files do not need PDF conversion — handle natively.");
-        }
-        else if (SlidesExts.Contains(ext))
-        {
-            using var pres = new Aspose.Slides.Presentation(filePath);
-            pres.Save(outPath, Aspose.Slides.Export.SaveFormat.Pdf);
-        }
-        else
-        {
+
+        if (!WordExts.Contains(ext) && !SlidesExts.Contains(ext))
             throw new NotSupportedException($"Cannot convert '{ext}' to PDF.");
-        }
+
+        OfficeConverter.Convert(filePath, outPath);
 
         return outPath;
     }
 
     public string CreateHighlightedExcel(string filePath, List<string> textsToHighlight)
     {
-        var wb = new Aspose.Cells.Workbook(filePath);
+        using var wb = ExcelDocument.Load(filePath);
         ApplyCellHighlights(wb, textsToHighlight);
         var outPath = Path.Combine(Path.GetTempPath(), $"highlighted_{Guid.NewGuid():N}.xlsx");
         wb.Save(outPath);
@@ -68,7 +61,7 @@ public class OfficeConversionService : IOfficeConversionService
 
     public string AddHighlightsToExistingExcel(string existingXlsxPath, List<string> textsToAdd)
     {
-        var wb = new Aspose.Cells.Workbook(existingXlsxPath);
+        using var wb = ExcelDocument.Load(existingXlsxPath);
         ApplyCellHighlights(wb, textsToAdd);
         var outPath = Path.Combine(Path.GetTempPath(), $"highlighted_{Guid.NewGuid():N}.xlsx");
         wb.Save(outPath);
@@ -77,68 +70,61 @@ public class OfficeConversionService : IOfficeConversionService
 
     public string ExportExcelToHtml(string xlsxPath)
     {
-        var wb = new Aspose.Cells.Workbook(xlsxPath);
-
-        // Restrict each sheet's print area to the actual data range so the HTML
-        // export omits empty trailing rows and columns.
-        foreach (var ws in wb.Worksheets)
-        {
-            int lastRow = ws.Cells.MaxDataRow;
-            int lastCol = ws.Cells.MaxDataColumn;
-            if (lastRow >= 0 && lastCol >= 0)
-            {
-                var range = ws.Cells.CreateRange(0, 0, lastRow + 1, lastCol + 1);
-                ws.PageSetup.PrintArea = range.RefersTo;
-            }
-        }
-
         var outDir = Path.Combine(Path.GetTempPath(), $"preview_{Guid.NewGuid():N}");
         Directory.CreateDirectory(outDir);
         var outPath = Path.Combine(outDir, "preview.html");
-        wb.Save(outPath, Aspose.Cells.SaveFormat.Html);
+        using var wb = ExcelDocument.Load(xlsxPath);
+        // Visual-review profile keeps cell fills, so the yellow highlights show in the preview
+        wb.SaveAsHtml(outPath, ExcelHtmlExportOptions.CreateVisualReviewProfile());
         return outPath;
     }
 
-    private static void ApplyCellHighlights(Aspose.Cells.Workbook wb, List<string> texts)
+    private static void ApplyCellHighlights(ExcelDocument wb, List<string> texts)
     {
-        var highlightStyle = wb.CreateStyle();
-        highlightStyle.ForegroundColor = System.Drawing.Color.FromArgb(255, 215, 0);
-        highlightStyle.Pattern = Aspose.Cells.BackgroundType.Solid;
-
-        var styleFlag = new Aspose.Cells.StyleFlag { CellShading = true };
-        var findOptions = new Aspose.Cells.FindOptions
+        var highlight = OfficeColor.Parse("FFD700");
+        foreach (var sheet in wb.Sheets)
         {
-            CaseSensitive = false,
-            LookInType = Aspose.Cells.LookInType.Values,
-            LookAtType = Aspose.Cells.LookAtType.Contains
-        };
+            var usedRange = sheet.UsedRange;
+            if (usedRange is null) continue;
 
-        foreach (var sheet in wb.Worksheets)
-        {
-            foreach (var text in texts.Where(t => !string.IsNullOrWhiteSpace(t)))
+            for (var row = usedRange.FirstRow; row <= usedRange.LastRow; row++)
+            for (var column = usedRange.FirstColumn; column <= usedRange.LastColumn; column++)
             {
-                Aspose.Cells.Cell? cell = null;
-                do
-                {
-                    cell = sheet.Cells.Find(text, cell, findOptions);
-                    cell?.SetStyle(highlightStyle, styleFlag);
-                } while (cell != null);
+                var cell = sheet.Cell(row, column);
+                var value = cell.GetFormattedText(System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+                if (texts.Any(text => !string.IsNullOrWhiteSpace(text)
+                    && value.Contains(text, StringComparison.OrdinalIgnoreCase)))
+                    cell.SetFillColor(highlight);
             }
         }
     }
 
     public string RedactExcel(string filePath, List<string> textsToRedact)
     {
-        var wb = new Aspose.Cells.Workbook(filePath);
-        var replaceOptions = new Aspose.Cells.ReplaceOptions
+        using var wb = ExcelDocument.Load(filePath);
+        foreach (var sheet in wb.Sheets)
         {
-            CaseSensitive = false,
-            MatchEntireCellContents = false
-        };
+            var usedRange = sheet.UsedRange;
+            if (usedRange is null) continue;
 
-        foreach (var text in textsToRedact.Where(t => !string.IsNullOrWhiteSpace(t)))
-        {
-            wb.Replace(text, new string('█', text.Length), replaceOptions);
+            for (var row = usedRange.FirstRow; row <= usedRange.LastRow; row++)
+            for (var column = usedRange.FirstColumn; column <= usedRange.LastColumn; column++)
+            {
+                var cell = sheet.Cell(row, column);
+                var original = cell.GetFormattedText(System.Globalization.CultureInfo.InvariantCulture)
+                    ?? string.Empty;
+                if (original.Length == 0) continue;
+
+                // Longest first so overlapping entities don't leave partial text behind
+                var value = original;
+                foreach (var text in textsToRedact.Where(t => !string.IsNullOrWhiteSpace(t)).OrderByDescending(t => t.Length))
+                    if (value.Contains(text, StringComparison.OrdinalIgnoreCase))
+                        value = ReplaceTextCaseInsensitive(value, text, new string('█', text.Length));
+
+                // Only touch cells that actually contained PII (numbers/formulas elsewhere stay intact)
+                if (!string.Equals(value, original, StringComparison.Ordinal))
+                    cell.SetValue(value);
+            }
         }
 
         var ext = Path.GetExtension(filePath);
@@ -147,5 +133,23 @@ public class OfficeConversionService : IOfficeConversionService
             Path.GetFileNameWithoutExtension(filePath) + "_redacted" + ext);
         wb.Save(outPath);
         return outPath;
+    }
+
+    private static string ReplaceTextCaseInsensitive(string input, string find, string replacement)
+    {
+        var start = 0;
+        var result = new System.Text.StringBuilder();
+        while (true)
+        {
+            var match = input.IndexOf(find, start, StringComparison.OrdinalIgnoreCase);
+            if (match < 0)
+            {
+                result.Append(input, start, input.Length - start);
+                return result.ToString();
+            }
+
+            result.Append(input, start, match - start).Append(replacement);
+            start = match + find.Length;
+        }
     }
 }

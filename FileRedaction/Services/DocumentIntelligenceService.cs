@@ -1,5 +1,4 @@
-extern alias AsposeDrawing;
-using AD = AsposeDrawing::System.Drawing;
+using ImageMagick;
 using Azure;
 using Azure.AI.FormRecognizer.DocumentAnalysis;
 
@@ -190,28 +189,24 @@ public class DocumentIntelligenceService : IDocumentIntelligenceService
 
     private static (MemoryStream Stream, int OrigWidth, int OrigHeight) CompressImage(string filePath)
     {
-        using var src = new AD.Bitmap(new MemoryStream(File.ReadAllBytes(filePath)));
-        int origWidth  = src.Width;
-        int origHeight = src.Height;
+        using var image = new MagickImage(File.ReadAllBytes(filePath));
+        int origWidth  = (int)image.Width;
+        int origHeight = (int)image.Height;
 
         // Scale down proportionally so the compressed JPEG fits under MaxImageBytes
         var fileSize = new FileInfo(filePath).Length;
-        float scale = Math.Min(1f, (float)Math.Sqrt((double)MaxImageBytes / fileSize) * 0.9f);
-        int w = Math.Max(1, (int)(origWidth  * scale));
-        int h = Math.Max(1, (int)(origHeight * scale));
+        double scale = Math.Min(1.0, Math.Sqrt((double)MaxImageBytes / fileSize) * 0.9);
+        uint w = (uint)Math.Max(1, (int)(origWidth  * scale));
+        uint h = (uint)Math.Max(1, (int)(origHeight * scale));
 
-        using var resized = new AD.Bitmap(w, h);
-        using (var g = AD.Graphics.FromImage(resized))
-            g.DrawImage(src, 0, 0, w, h);
+        // JPEG has no alpha channel — flatten transparency onto white
+        image.ColorAlpha(MagickColors.White);
+        image.Resize(w, h);
+        image.Format = MagickFormat.Jpeg;
+        image.Quality = 75;
 
         var ms = new MemoryStream();
-        var jpegEncoder = AsposeDrawing::System.Drawing.Imaging.ImageCodecInfo
-            .GetImageEncoders()
-            .First(c => c.FormatID == AsposeDrawing::System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
-        var encoderParams = new AsposeDrawing::System.Drawing.Imaging.EncoderParameters(1);
-        encoderParams.Param[0] = new AsposeDrawing::System.Drawing.Imaging.EncoderParameter(
-            AsposeDrawing::System.Drawing.Imaging.Encoder.Quality, 75L);
-        resized.Save(ms, jpegEncoder, encoderParams);
+        image.Write(ms);
         ms.Position = 0;
         return (ms, origWidth, origHeight);
     }

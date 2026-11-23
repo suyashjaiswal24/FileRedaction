@@ -246,7 +246,7 @@ export default function App() {
               </div>
               <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>Redaction Complete</h2>
               <p style={{ color: '#555', marginBottom: 28, fontSize: 15 }}>
-                Your redacted PDF has been downloaded. Selected PII regions have been permanently blacked out using Aspose.PDF.
+                Your redacted PDF has been downloaded. Selected PII regions have been permanently blacked out.
               </p>
               <button
                 style={styles.primaryBtn}

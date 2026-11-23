@@ -181,6 +181,7 @@ export default function DocumentPreview({ sessionId, selectedEntityIds, selected
                     enableAnnotations: true,
                     enableSearch: true,
                     enablePrint: true,
+                    enableRedaction: true,
                   },
                 }}
                 style={{ width: '100%', height: 580 }}

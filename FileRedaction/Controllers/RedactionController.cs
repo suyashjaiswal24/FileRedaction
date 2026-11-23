@@ -62,6 +62,10 @@ public class RedactionController : ControllerBase
         _scopeFactory = scopeFactory;
     }
 
+    /// <summary>Office formats Azure Document Intelligence cannot read (it accepts only docx/xlsx/pptx). These are converted to PDF first and the PDF is analysed instead.</summary>
+    private static readonly HashSet<string> DiUnsupportedOfficeExts =
+        [".doc", ".docm", ".odt", ".rtf", ".ppt", ".odp"];
+
     /// <summary>
     /// Phase 1 (sync): saves the file and returns a sessionId immediately.
     /// Phase 2 (background): DI extraction + PII detection run async; poll GET /{sessionId}/status.
@@ -159,9 +163,20 @@ public class RedactionController : ControllerBase
             logger.LogInformation("Background: starting DI extraction{FaceNote} for session {Id}",
                 faceRunning ? " + face detection in parallel" : "", sessionId);
 
+            var diPath = filePath;
+            if (DiUnsupportedOfficeExts.Contains(ext))
+            {
+                try { diPath = GetOrConvertToPdf(session); }
+                catch (Exception convEx)
+                {
+                    throw new InvalidOperationException(
+                        $"'{ext}' files could not be converted for analysis. Please save the file as .docx / .pptx / .xlsx (or PDF) and upload again. ({convEx.Message})", convEx);
+                }
+            }
+
             var diTask = isTxt
                 ? Task.FromResult(ExtractFromPlainText(filePath))
-                : docIntelligence.AnalyzeDocumentAsync(filePath);
+                : docIntelligence.AnalyzeDocumentAsync(diPath);
 
             var faceTask = faceRunning
                 ? SafeDetectFacesAsync(filePath, faceDetection, logger)
@@ -322,66 +337,8 @@ public class RedactionController : ControllerBase
             return faces.Select((f, i) => FaceToImageEntity(f, i + 1, pageNumber: 1)).ToList();
         }
 
-        if (ext == ".pdf")
-        {
-            const float renderDpi  = 150f;
-            const float ptsPerInch = 72f;
-            float       scaleToPts = ptsPerInch / renderDpi;
-
-            using var doc       = new Aspose.Pdf.Document(filePath);
-            var resolution      = new Aspose.Pdf.Devices.Resolution((int)renderDpi);
-            var pngDevice       = new Aspose.Pdf.Devices.PngDevice(resolution);
-            int pageCount       = doc.Pages.Count;
-
-            // Render all pages to memory up-front, then fire all Face API calls in parallel.
-            // Sequential calls (one await per page) would add ~0.5–1 s per page for a multi-page PDF.
-            var pageStreams  = new MemoryStream[pageCount];
-            var pageHeights = new float[pageCount];
-
-            for (int i = 0; i < pageCount; i++)
-            {
-                var ms = new MemoryStream();
-                pngDevice.Process(doc.Pages[i + 1], ms);
-                ms.Position    = 0;
-                pageStreams[i]  = ms;
-                pageHeights[i] = (float)doc.Pages[i + 1].Rect.Height;
-            }
-
-            var faceTasks   = pageStreams.Select(s => faceDetection.DetectFacesAsync(s)).ToArray();
-            var faceResults = await Task.WhenAll(faceTasks);
-
-            foreach (var s in pageStreams) s.Dispose();
-
-            var results   = new List<PiiEntityResult>();
-            int faceIndex = 1;
-
-            for (int i = 0; i < pageCount; i++)
-            {
-                float pageHeightPts = pageHeights[i];
-                foreach (var f in faceResults[i])
-                {
-                    // Convert pixel coords (at renderDpi) → Aspose.Pdf points (origin = bottom-left)
-                    float x1 = f.Left  * scaleToPts;
-                    float x2 = (f.Left + f.Width)  * scaleToPts;
-                    float y1 = pageHeightPts - (f.Top + f.Height) * scaleToPts;  // bottom
-                    float y2 = pageHeightPts - f.Top * scaleToPts;               // top
-
-                    results.Add(new PiiEntityResult
-                    {
-                        Id              = Guid.NewGuid().ToString("N")[..8],
-                        Text            = $"Face #{faceIndex++}",
-                        Category        = "Face",
-                        SubCategory     = string.Empty,
-                        ConfidenceScore = 1.0,
-                        OccurrenceCount = 1,
-                        PdfFaceBoxes    = [new PdfFaceBox { PageNumber = i + 1, X1 = x1, Y1 = y1, X2 = x2, Y2 = y2 }]
-                    });
-                }
-            }
-
-            return results;
-        }
-
+        // PDFs are no longer rasterised for face detection — faces on PDF pages are
+        // handled by the manual redaction tool in the document preview.
         return [];
     }
 
@@ -437,6 +394,51 @@ public class RedactionController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Adds a bounding region for every occurrence of each entity's text in the DI word list
+    /// (Document Intelligence coordinates), so all occurrences are highlighted/redacted — not just
+    /// the ones the PII service flagged. Matching is word-by-word, case-insensitive, ignoring
+    /// leading/trailing punctuation on each DI word.
+    /// </summary>
+    private static void ExpandRegionsByText(SessionData session, IEnumerable<PiiEntityResult> entities)
+    {
+        var words = session.Words;
+        if (words.Count == 0) return;
+
+        static string Norm(string s) => s.Trim().Trim('.', ',', ';', ':', '(', ')', '[', ']', '"', '\'', '<', '>');
+
+        foreach (var entity in entities)
+        {
+            var tokens = (entity.Text ?? string.Empty)
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                .Select(Norm).Where(t => t.Length > 0).ToArray();
+            if (tokens.Length == 0) continue;
+
+            var known = new HashSet<string>(entity.BoundingRegions.Select(r =>
+                $"{r.PageNumber}|{string.Join(',', r.Polygon.Select(v => Math.Round(v, 3)))}"));
+
+            for (int i = 0; i + tokens.Length <= words.Count; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < tokens.Length && match; j++)
+                    match = words[i + j].PageNumber == words[i].PageNumber
+                            && string.Equals(Norm(words[i + j].Text), tokens[j], StringComparison.OrdinalIgnoreCase);
+                if (!match) continue;
+
+                for (int j = 0; j < tokens.Length; j++)
+                {
+                    var w = words[i + j];
+                    var key = $"{w.PageNumber}|{string.Join(',', w.Polygon.Select(v => Math.Round(v, 3)))}";
+                    if (!known.Add(key)) continue;
+                    entity.BoundingRegions.Add(new BoundingRegion
+                    {
+                        PageNumber = w.PageNumber, Polygon = w.Polygon, IsPixelUnit = w.IsPixelUnit
+                    });
+                }
+            }
+        }
+    }
+
     [HttpPost("preview")]
     public async Task<ActionResult> Preview([FromBody] PreviewRequest request)
     {
@@ -475,7 +477,7 @@ public class RedactionController : ControllerBase
             return Ok(new { fileUrl = $"/api/redaction/file/{Uri.EscapeDataString(token)}", hasHighlights = bodyEntities.Count > 0, fileType = "html", isEmailSession = true, attachmentCount = attachCount });
         }
 
-        // Plain text: generate highlighted HTML directly — no Aspose PDF conversion needed
+        // Plain text: generate highlighted HTML directly — no PDF conversion needed
         if (ext == ".txt")
         {
             var selectedSet2 = new HashSet<string>(request.SelectedEntityIds);
@@ -518,12 +520,14 @@ public class RedactionController : ControllerBase
             if (canIncremental)
             {
                 var added = session.Entities.Where(e => addedIds.Contains(e.Id)).ToList();
+                ExpandRegionsByText(session, added);
                 _logger.LogInformation("Incremental highlight: adding {Count} entity/entities to cached preview", added.Count);
                 highlighted = await _redaction.AddHighlightsToExistingAsync(session.CachedHighlightWorkingPath!, added);
             }
             else
             {
                 var selected = session.Entities.Where(e => selectedSet.Contains(e.Id)).ToList();
+                ExpandRegionsByText(session, selected);
                 highlighted = await _redaction.CreateHighlightedPreviewAsync(workingFilePath, selected);
             }
             session.CachedHighlightWorkingPath = highlighted;
@@ -606,7 +610,7 @@ public class RedactionController : ControllerBase
     }
 
     /// <summary>
-    /// Serves Aspose-generated HTML preview directories so companion files (CSS, sheet HTMs) resolve correctly.
+    /// Serves generated HTML preview directories so companion files (CSS, sheet HTMs) resolve correctly.
     /// The browser fetches preview.html first, then requests relative paths like preview_files/sheet001.htm
     /// which all resolve to this same endpoint.
     /// </summary>
@@ -665,7 +669,7 @@ public class RedactionController : ControllerBase
     /// <summary>
     /// Manually adds a word or phrase to a session's entity list.
     /// For image files: resolves bounding regions immediately from DI word list.
-    /// For PDFs: TextFragmentAbsorber resolves positions at redaction time.
+    /// For PDFs: regions are resolved from the DI word list.
     /// </summary>
     [HttpPost("{sessionId}/add-entity")]
     public ActionResult<PiiEntityResult> AddEntity(string sessionId, [FromBody] AddEntityRequest request)
@@ -685,10 +689,8 @@ public class RedactionController : ControllerBase
         }
 
         // Resolve bounding regions from DI word list for all file types.
-        // Images: always needed (no TextFragmentAbsorber).
-        // PDFs: needed as fallback for text inside embedded images (TextFragmentAbsorber only
-        //       sees the text layer; the fallback in RedactionService uses these regions when
-        //       the absorber returns zero matches).
+        // Images: always needed (no text layer).
+        // PDFs: the redaction service paints these regions.
         var trimmed = request.Text.Trim();
         List<BoundingRegion> regions = session.Words
             .Where(w => trimmed.Contains(w.Text, StringComparison.OrdinalIgnoreCase) ||
@@ -758,14 +760,14 @@ public class RedactionController : ControllerBase
 
     /// <summary>
     /// Builds a self-contained HTML file that renders plain text with selected entities
-    /// highlighted in yellow — no Aspose or PDF conversion required.
+    /// highlighted in yellow — no PDF conversion required.
     /// </summary>
     private static string CreateTxtHighlightHtml(string filePath, List<PiiEntityResult> entities)
     {
         var text = System.IO.File.ReadAllText(filePath);
 
         // Find all occurrences of each entity text by string search — same approach as
-        // PDF (TextFragmentAbsorber) and Excel. Avoids depending on Azure char offsets,
+        // Excel. Avoids depending on Azure char offsets,
         // which can drift when the text contains mixed line endings or Unicode sequences.
         var ranges = new List<(int start, int end)>();
         foreach (var entity in entities)
@@ -895,7 +897,7 @@ public class RedactionController : ControllerBase
             var text = System.IO.File.ReadAllText(session.FilePath);
 
             // Redact by text search (longest first to avoid partial overlaps),
-            // consistent with PDF (TextFragmentAbsorber) and Excel redaction.
+            // consistent with Excel redaction.
             foreach (var entity in selected.OrderByDescending(e => e.Text.Length))
                 text = ReplaceTextCaseInsensitive(text, entity.Text, new string('█', entity.Text.Length));
 
@@ -919,6 +921,7 @@ public class RedactionController : ControllerBase
             var redactFilePath = _officeConverter.NeedsPdfConversion(ext)
                 ? GetOrConvertToPdf(session)
                 : session.FilePath;
+            ExpandRegionsByText(session, selected);
             redactedPath = await _redaction.ApplyPermanentRedactionAsync(redactFilePath, selected);
         }
 
